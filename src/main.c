@@ -1,5 +1,4 @@
 // nfzf - NBL Fuzzy Finder
-// A fast, minimal fuzzy finder with vim-like keybindings
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <stdlib.h>
@@ -12,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <strings.h>
+#include <sys/wait.h>
 
 #define MAX_LINES 100000
 #define MAX_LINE_LEN 2048
@@ -36,6 +36,8 @@ typedef struct {
     int exact_match;
     char delimiter;
     int preview_enabled;
+    char ssh_host[256];
+    char ssh_user[256];
 } FuzzyState;
 
 static void usage(const char *prog) {
@@ -177,11 +179,89 @@ static void load_stream(FuzzyState *st, FILE *fp) {
         add_line(st, line);
     }
 }
+static int parse_ssh_path(const char *path, char *user, char *host, char *remote_path) {
+    if (!strchr(path, ':')) return 0;  // Not an SSH path
+    
+    char temp[1024];
+    strncpy(temp, path, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+    
+    char *colon = strchr(temp, ':');
+    if (!colon) return 0;
+    
+    *colon = '\0';
+    char *userhost = temp;
+    char *rpath = colon + 1;
+    
+    // Parse user@host or just host
+    char *at = strchr(userhost, '@');
+    if (at) {
+        *at = '\0';
+        strncpy(user, userhost, 255);
+        strncpy(host, at + 1, 255);
+    } else {
+        user[0] = '\0';  // No user specified
+        strncpy(host, userhost, 255);
+    }
+    
+    strncpy(remote_path, rpath, 255);
+    return 1;
+}
 
+// NEW: Execute command via SSH and capture output
+static FILE *ssh_popen(const char *user, const char *host, const char *command) {
+    char ssh_cmd[2048];
+    
+    if (user && user[0]) {
+        snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh %s@%s '%s'", user, host, command);
+    } else {
+        snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh %s '%s'", host, command);
+    }
+    
+    return popen(ssh_cmd, "r");
+}
+
+// NEW: Load file content from SSH
+static int load_ssh_file(FuzzyState *st, const char *path) {
+    char user[256], host[256], remote_path[256];
+    
+    if (!parse_ssh_path(path, user, host, remote_path)) {
+        return 0;  // Not an SSH path
+    }
+    
+    // Save SSH info for potential later use
+    strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
+    strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
+    
+    // Execute 'cat' command via SSH
+    char command[512];
+    snprintf(command, sizeof(command), "cat '%s'", remote_path);
+    
+    FILE *fp = ssh_popen(user, host, command);
+    if (!fp) {
+        fprintf(stderr, "nfzf: failed to execute SSH command for '%s'\n", path);
+        return 0;
+    }
+    
+    load_stream(st, fp);
+    pclose(fp);
+    return 1;
+}
 static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
     for (int i = first_file_idx; i < argc; i++) {
         const char *path = argv[i];
+        
+        // Try SSH path first
+        if (strchr(path, ':')) {
+            if (load_ssh_file(st, path)) {
+                loaded_any = 1;
+                if (st->line_count >= MAX_LINES) break;
+                continue;
+            }
+        }
+        
+        // Fall back to local file
         FILE *fp = fopen(path, "r");
         if (!fp) {
             fprintf(stderr, "nfzf: failed to open '%s': %s\n", path, strerror(errno));
@@ -523,7 +603,8 @@ int main(int argc, char **argv) {
     st->delimiter = '\0';
     st->query[0] = '\0';
     st->query_len = 0;
-
+    st->ssh_host[0]='\0';
+    st->ssh_user[0]='\0';
     int first_file_idx = parse_flags(argc, argv, st);
     if (first_file_idx < 0) {
         free(st);
