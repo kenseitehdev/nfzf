@@ -1,38 +1,88 @@
-CC = clang
-CFLAGS = -Wall -Wextra -std=c11
-LDFLAGS = -lncurses
+# Makefile for nfzf (termios version)
 
-SRC_DIR = src
-BUILD_DIR = build
-BIN_DIR = bin
+CC := clang
+STRIP := strip
 
-SRC = $(SRC_DIR)/main.c
-OBJ = $(BUILD_DIR)/main.o
-TARGET = $(BIN_DIR)/nfzf
+SRC := src/main.c
+TARGET := nf
+BINDIR := bin
 
-all: $(TARGET)
+CFLAGS := -Wall -Wextra -std=c99
+LDFLAGS :=
 
-$(TARGET): $(OBJ) | $(BIN_DIR)
-	$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS)
+CFLAGS_DEBUG := -g -O0
+CFLAGS_RELEASE := -O2
+CFLAGS_SIZE := -Oz -flto -ffunction-sections -fdata-sections
+CFLAGS_TINY := -Oz -flto -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-$(OBJ): $(SRC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $(SRC) -o $(OBJ)
+UNAME := $(shell uname)
+ifeq ($(UNAME), Darwin)
+LDFLAGS += -dead_strip
+else ifeq ($(UNAME), Linux)
+LDFLAGS += -Wl,--gc-sections
+endif
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+.PHONY: all
+all: release
 
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
+.PHONY: debug
+debug: CFLAGS += $(CFLAGS_DEBUG)
+debug: $(TARGET)_debug
 
+$(TARGET)_debug: $(SRC)
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(SRC) -o $(BINDIR)/$@ $(LDFLAGS)
+	@echo "Built debug: $(BINDIR)/$@"
+	@ls -lh $(BINDIR)/$@
+
+.PHONY: release
+release: CFLAGS += $(CFLAGS_RELEASE)
+release: $(TARGET)
+
+$(TARGET): $(SRC)
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(SRC) -o $(BINDIR)/$@ $(LDFLAGS)
+	@echo "Built release: $(BINDIR)/$@"
+	@ls -lh $(BINDIR)/$@
+
+.PHONY: small
+small: CFLAGS += $(CFLAGS_SIZE)
+small: $(TARGET)_small
+
+$(TARGET)_small: $(SRC)
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(SRC) -o $(BINDIR)/$@ $(LDFLAGS)
+	@echo "Built small: $(BINDIR)/$@"
+	@ls -lh $(BINDIR)/$@
+
+.PHONY: tiny
+tiny: CFLAGS += $(CFLAGS_TINY)
+tiny: $(TARGET)_tiny
+
+$(TARGET)_tiny: $(SRC)
+	@mkdir -p $(BINDIR)
+	$(CC) $(CFLAGS) $(SRC) -o $(BINDIR)/$@ $(LDFLAGS)
+	@echo "Built tiny: $(BINDIR)/$@"
+	@ls -lh $(BINDIR)/$@
+
+.PHONY: compare
+compare: debug release small tiny
+	@echo ""
+	@echo "=== Size Comparison ==="
+	@ls -lh $(BINDIR)/$(TARGET)* | awk '{print $$5 "\t" $$9}'
+
+.PHONY: clean
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -rf $(BINDIR)/$(TARGET)*
+	@echo "Cleaned"
 
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/nfzf
-	@echo "Installed nfzf to /usr/local/bin/"
-
-uninstall:
-	rm -f /usr/local/bin/nfzf
-	@echo "Uninstalled nfzf"
-
-.PHONY: all clean install uninstall
+.PHONY: help
+help:
+	@echo "Targets:"
+	@echo "  all (default) - Build release"
+	@echo "  debug         - Build with -g"
+	@echo "  release       - Build with -O2"
+	@echo "  small         - Build with -Oz"
+	@echo "  tiny          - Build with max optimization"
+	@echo "  compare       - Build all and compare sizes"
+	@echo "  clean         - Remove builds"
