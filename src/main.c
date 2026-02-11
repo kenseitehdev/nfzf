@@ -1,45 +1,26 @@
-// nfzf - NBL Fuzzy Finder (termios version for embedded)
+// nfzf - NBL Fuzzy Finder
 #define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE
-#define _BSD_SOURCE
-#define _DARWIN_C_SOURCE
-#include <signal.h>
-
-#include <termios.h>
-#include <unistd.h>
+#include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <locale.h>
+#include <unistd.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/ioctl.h>
 #include <strings.h>
-#include <fcntl.h>      // for open(), O_RDWR
-#define MAX_LINES 10000
+#include <sys/wait.h>
+
+#define MAX_LINES 100000
 #define MAX_LINE_LEN 2048
 
-// ANSI escape sequences
-#define ESC "\x1b"
-#define CSI ESC "["
-
-#define CLEAR_SCREEN CSI "2J"
-#define CURSOR_HOME CSI "H"
-#define CURSOR_HIDE CSI "?25l"
-#define CURSOR_SHOW CSI "?25h"
-#define CLEAR_LINE CSI "2K"
-#define SAVE_CURSOR ESC "7"
-#define RESTORE_CURSOR ESC "8"
-
-// Colors
-#define COLOR_RESET CSI "0m"
-#define COLOR_BOLD CSI "1m"
-#define COLOR_REVERSE CSI "7m"
-#define COLOR_YELLOW CSI "33m"
-#define COLOR_CYAN CSI "36m"
-#define COLOR_WHITE CSI "37m"
+#define COLOR_NORMAL     1
+#define COLOR_SELECTED   2
+#define COLOR_MATCH      3
+#define COLOR_STATUS     4
+#define COLOR_QUERY      5
 
 typedef struct {
     char *lines[MAX_LINES];
@@ -54,112 +35,10 @@ typedef struct {
     int case_sensitive;
     int exact_match;
     char delimiter;
+    int preview_enabled;
     char ssh_host[256];
     char ssh_user[256];
 } FuzzyState;
-
-// Terminal state
-static struct termios orig_termios;
-static int term_rows = 24;
-static int term_cols = 80;
-static volatile sig_atomic_t winch_received = 0;
-
-// Signal handler for window resize
-static void sigwinch_handler(int sig) {
-    (void)sig;
-    winch_received = 1;
-}
-
-// Get terminal size
-static void update_term_size(void) {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-        term_rows = ws.ws_row;
-        term_cols = ws.ws_col;
-    }
-}
-
-// Restore terminal to original state
-static void disable_raw_mode(void) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    write(STDOUT_FILENO, CURSOR_SHOW, strlen(CURSOR_SHOW));
-    write(STDOUT_FILENO, COLOR_RESET, strlen(COLOR_RESET));
-}
-
-// Enable raw mode for character-by-character input
-static void enable_raw_mode(void) {
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    atexit(disable_raw_mode);
-
-    struct termios raw = orig_termios;
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cflag |= (CS8);
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 0;   // Return immediately
-    raw.c_cc[VTIME] = 1;  // 100ms timeout
-
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-}
-
-// Move cursor to position (1-indexed like ncurses)
-static void move_cursor(int row, int col) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), CSI "%d;%dH", row + 1, col + 1);
-    write(STDOUT_FILENO, buf, strlen(buf));
-}
-
-// Clear from cursor to end of line
-static void clear_to_eol(void) {
-    write(STDOUT_FILENO, CSI "K", 3);
-}
-
-// Read a single key, handling escape sequences
-static int read_key(void) {
-    char c;
-    while (read(STDIN_FILENO, &c, 1) == 0) {
-        // Check for resize signal
-        if (winch_received) {
-            winch_received = 0;
-            update_term_size();
-            return -1000;  // Special code for resize
-        }
-    }
-
-    if (c != '\x1b') return c;
-
-    // Escape sequence - read next chars with timeout
-    char seq[3];
-    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
-
-    if (seq[0] == '[') {
-        if (seq[1] >= '0' && seq[1] <= '9') {
-            // Extended sequence
-            if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
-            if (seq[2] == '~') {
-                switch (seq[1]) {
-                    case '1': return 1000; // Home
-                    case '3': return 1001; // Delete
-                    case '4': return 1002; // End
-                    case '5': return 1003; // Page Up
-                    case '6': return 1004; // Page Down
-                }
-            }
-        } else {
-            switch (seq[1]) {
-                case 'A': return 1010; // Up arrow
-                case 'B': return 1011; // Down arrow
-                case 'C': return 1012; // Right arrow
-                case 'D': return 1013; // Left arrow
-                case 'H': return 1000; // Home
-                case 'F': return 1002; // End
-            }
-        }
-    }
-
-    return '\x1b';
-}
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -241,10 +120,8 @@ static int fuzzy_score(const char *needle, const char *haystack, int case_sensit
     return score;
 }
 
-static FuzzyState *g_sort_ctx = NULL;
-
-static int compare_scores(const void *a, const void *b) {
-    FuzzyState *st = g_sort_ctx;
+static int compare_scores(const void *a, const void *b, void *state) {
+    FuzzyState *st = (FuzzyState*)state;
     int idx_a = *(const int*)a;
     int idx_b = *(const int*)b;
 
@@ -252,6 +129,11 @@ static int compare_scores(const void *a, const void *b) {
     if (diff != 0) return diff;
 
     return (int)strlen(st->lines[idx_a]) - (int)strlen(st->lines[idx_b]);
+}
+
+static FuzzyState *g_sort_ctx = NULL;
+static int compare_scores_static(const void *a, const void *b) {
+    return compare_scores(a, b, g_sort_ctx);
 }
 
 static void update_matches(FuzzyState *st) {
@@ -272,7 +154,7 @@ static void update_matches(FuzzyState *st) {
     }
 
     g_sort_ctx = st;
-    qsort(st->match_indices, st->match_count, sizeof(int), compare_scores);
+    qsort(st->match_indices, st->match_count, sizeof(int), compare_scores_static);
     g_sort_ctx = NULL;
 
     st->selected = 0;
@@ -297,9 +179,8 @@ static void load_stream(FuzzyState *st, FILE *fp) {
         add_line(st, line);
     }
 }
-
 static int parse_ssh_path(const char *path, char *user, char *host, char *remote_path) {
-    if (!strchr(path, ':')) return 0;
+    if (!strchr(path, ':')) return 0;  // Not an SSH path
 
     char temp[1024];
     strncpy(temp, path, sizeof(temp) - 1);
@@ -312,13 +193,14 @@ static int parse_ssh_path(const char *path, char *user, char *host, char *remote
     char *userhost = temp;
     char *rpath = colon + 1;
 
+    // Parse user@host or just host
     char *at = strchr(userhost, '@');
     if (at) {
         *at = '\0';
         strncpy(user, userhost, 255);
         strncpy(host, at + 1, 255);
     } else {
-        user[0] = '\0';
+        user[0] = '\0';  // No user specified
         strncpy(host, userhost, 255);
     }
 
@@ -326,6 +208,7 @@ static int parse_ssh_path(const char *path, char *user, char *host, char *remote
     return 1;
 }
 
+// NEW: Execute command via SSH and capture output
 static FILE *ssh_popen(const char *user, const char *host, const char *command) {
     char ssh_cmd[2048];
 
@@ -338,16 +221,19 @@ static FILE *ssh_popen(const char *user, const char *host, const char *command) 
     return popen(ssh_cmd, "r");
 }
 
+// NEW: Load file content from SSH
 static int load_ssh_file(FuzzyState *st, const char *path) {
     char user[256], host[256], remote_path[256];
 
     if (!parse_ssh_path(path, user, host, remote_path)) {
-        return 0;
+        return 0;  // Not an SSH path
     }
 
+    // Save SSH info for potential later use
     strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
 
+    // Execute 'cat' command via SSH
     char command[512];
     snprintf(command, sizeof(command), "cat '%s'", remote_path);
 
@@ -361,12 +247,12 @@ static int load_ssh_file(FuzzyState *st, const char *path) {
     pclose(fp);
     return 1;
 }
-
 static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
     for (int i = first_file_idx; i < argc; i++) {
         const char *path = argv[i];
 
+        // Try SSH path first
         if (strchr(path, ':')) {
             if (load_ssh_file(st, path)) {
                 loaded_any = 1;
@@ -375,6 +261,7 @@ static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx)
             }
         }
 
+        // Fall back to local file
         FILE *fp = fopen(path, "r");
         if (!fp) {
             fprintf(stderr, "nfzf: failed to open '%s': %s\n", path, strerror(errno));
@@ -398,23 +285,18 @@ static void free_state(FuzzyState *st) {
     free(st->match_indices);
 }
 
-// Write string to stdout
-static void write_str(const char *s) {
-    write(STDOUT_FILENO, s, strlen(s));
-}
-
 static void draw_status_bar(FuzzyState *st) {
-    // Draw horizontal line at second-to-last row
-    move_cursor(term_rows - 2, 0);
-    write_str(COLOR_RESET);
-    for (int i = 0; i < term_cols; i++) {
-        write(STDOUT_FILENO, "-", 1);
-    }
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
 
-    // Status line at bottom
-    move_cursor(term_rows - 1, 0);
-    clear_to_eol();
-    write_str(COLOR_WHITE COLOR_BOLD);
+    attron(COLOR_PAIR(COLOR_NORMAL));
+    mvhline(max_y - 2, 0, ACS_HLINE, max_x);
+    attroff(COLOR_PAIR(COLOR_NORMAL));
+
+    move(max_y - 1, 0);
+    clrtoeol();
+
+    attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 
     char left[256];
     snprintf(left, sizeof(left), "NBL NFZF | %d/%d matches | Mode: %s%s",
@@ -423,42 +305,33 @@ static void draw_status_bar(FuzzyState *st) {
              st->exact_match ? "EXACT" : "FUZZY",
              st->case_sensitive ? " (case)" : "");
 
-    write_str(left);
+    mvprintw(max_y - 1, 1, "%s", left);
 
     if (st->query_len > 0) {
         char right[300];
         snprintf(right, sizeof(right), "Query: %s ", st->query);
-        int rx = term_cols - (int)strlen(right) - 1;
-        if (rx > (int)strlen(left)) {
-            move_cursor(term_rows - 1, rx);
-            write_str(right);
-        }
+        int rx = max_x - (int)strlen(right) - 1;
+        if (rx < 1) rx = 1;
+        mvprintw(max_y - 1, rx, "%s", right);
     }
 
-    write_str(COLOR_RESET);
+    attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 }
 
-static void highlight_matches(const char *line, const char *query, int row, int x_start, int case_sensitive) {
-    move_cursor(row, x_start);
-
+static void highlight_matches(const char *line, const char *query, int y, int x_start, int max_x, int case_sensitive) {
     if (!query || !*query) {
-        // No query, just print
-        int max_len = term_cols - x_start;
-        if (max_len > 0) {
-            char buf[MAX_LINE_LEN];
-            snprintf(buf, max_len + 1, "%s", line);
-            write_str(buf);
-        }
+        mvprintw(y, x_start, "%.*s", max_x - x_start, line);
         return;
     }
 
     int q_len = (int)strlen(query);
     int l_len = (int)strlen(line);
+    int x = x_start;
+
     int matched[MAX_LINE_LEN] = {0};
 
-    // Mark matched characters
     int q_idx = 0;
-    for (int l_idx = 0; l_idx < l_len && q_idx < q_len; l_idx++) {
+    for (int l_idx = 0; l_idx < l_len && q_idx < q_len && x < max_x; l_idx++) {
         char q_ch = query[q_idx];
         char l_ch = line[l_idx];
 
@@ -473,28 +346,27 @@ static void highlight_matches(const char *line, const char *query, int row, int 
         }
     }
 
-    // Print with highlights
-    int x = x_start;
-    for (int i = 0; i < l_len && x < term_cols; i++) {
+    for (int i = 0; i < l_len && x < max_x; i++) {
         if (matched[i]) {
-            write_str(COLOR_YELLOW COLOR_BOLD);
-            write(STDOUT_FILENO, &line[i], 1);
-            write_str(COLOR_RESET);
+            attron(COLOR_PAIR(COLOR_MATCH) | A_BOLD);
+            mvaddch(y, x++, line[i]);
+            attroff(COLOR_PAIR(COLOR_MATCH) | A_BOLD);
         } else {
-            write(STDOUT_FILENO, &line[i], 1);
+            mvaddch(y, x++, line[i]);
         }
-        x++;
     }
 }
 
 static void draw_results(FuzzyState *st) {
-    // Clear all lines except status bar
-    for (int y = 0; y < term_rows - 2; y++) {
-        move_cursor(y, 0);
-        clear_to_eol();
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+
+    for (int y = 0; y < max_y - 2; y++) {
+        move(y, 0);
+        clrtoeol();
     }
 
-    int visible_lines = term_rows - 2;
+    int visible_lines = max_y - 2;
 
     for (int i = 0; i < visible_lines; i++) {
         int match_idx = st->scroll_offset + i;
@@ -505,34 +377,29 @@ static void draw_results(FuzzyState *st) {
 
         int is_selected = (match_idx == st->selected);
 
-        move_cursor(i, 0);
-
         if (is_selected) {
-            write_str(COLOR_REVERSE COLOR_BOLD);
-            // Fill entire line with reverse video
-            for (int x = 0; x < term_cols; x++) {
-                write(STDOUT_FILENO, " ", 1);
-            }
-            move_cursor(i, 1);
+            attron(COLOR_PAIR(COLOR_SELECTED) | A_REVERSE | A_BOLD);
+            mvhline(i, 0, ' ', max_x);
         }
 
-        write_str(is_selected ? "> " : "  ");
-        highlight_matches(line, st->query, i, 3, st->case_sensitive);
+        mvprintw(i, 1, is_selected ? "> " : "  ");
+        highlight_matches(line, st->query, i, 3, max_x, st->case_sensitive);
 
         if (is_selected) {
-            write_str(COLOR_RESET);
+            attroff(COLOR_PAIR(COLOR_SELECTED) | A_REVERSE | A_BOLD);
         }
     }
 }
 
 static void draw_ui(FuzzyState *st) {
-    // Don't clear screen on every draw - just overwrite changed areas
     draw_results(st);
     draw_status_bar(st);
+    refresh();
 }
 
 static void ensure_visible(FuzzyState *st) {
-    int visible_lines = term_rows - 2;
+    int max_y = getmaxy(stdscr);
+    int visible_lines = max_y - 2;
 
     if (st->selected < st->scroll_offset) st->scroll_offset = st->selected;
     if (st->selected >= st->scroll_offset + visible_lines)
@@ -548,14 +415,18 @@ static void move_down(FuzzyState *st) {
 }
 
 static void page_up(FuzzyState *st) {
-    int half_page = (term_rows - 2) / 2;
+    int max_y = getmaxy(stdscr);
+    int half_page = (max_y - 2) / 2;
+
     st->selected -= half_page;
     if (st->selected < 0) st->selected = 0;
     ensure_visible(st);
 }
 
 static void page_down(FuzzyState *st) {
-    int half_page = (term_rows - 2) / 2;
+    int max_y = getmaxy(stdscr);
+    int half_page = (max_y - 2) / 2;
+
     st->selected += half_page;
     if (st->selected >= st->match_count) st->selected = st->match_count - 1;
     if (st->selected < 0) st->selected = 0;
@@ -604,17 +475,24 @@ static void clear_query(FuzzyState *st) {
 }
 
 static void handle_resize(FuzzyState *st) {
-    update_term_size();
+    // Let ncurses update its idea of the terminal size.
+    // resizeterm(0,0) asks ncurses to query the new size.
+    resizeterm(0, 0);
+    // Ensure selection visibility under new viewport height.
     ensure_visible(st);
-    write_str(CLEAR_SCREEN);
+    clear();
     draw_ui(st);
 }
 
 static int handle_input(FuzzyState *st, int *running) {
-    int ch = read_key();
+    int ch = getch();
 
     switch (ch) {
-        case -1000:  // Window resize
+        case ERR:
+            // Shouldn’t happen in blocking mode, but safe to ignore.
+            return -2;
+
+        case KEY_RESIZE:
             handle_resize(st);
             break;
 
@@ -626,16 +504,17 @@ static int handle_input(FuzzyState *st, int *running) {
 
         case '\n':
         case '\r':
+        case KEY_ENTER:
             *running = 0;
             return st->selected;
 
         case 'j':
-        case 1011:  // Down arrow
+        case KEY_DOWN:
             move_down(st);
             break;
 
         case 'k':
-        case 1010:  // Up arrow
+        case KEY_UP:
             move_up(st);
             break;
 
@@ -659,8 +538,9 @@ static int handle_input(FuzzyState *st, int *running) {
             jump_bottom(st);
             break;
 
-        case 127:  // Backspace
-        case 8:    // Ctrl+H
+        case KEY_BACKSPACE:
+        case 127:
+        case 8:
             delete_char(st);
             break;
 
@@ -676,6 +556,8 @@ static int handle_input(FuzzyState *st, int *running) {
     return -2;
 }
 
+// Parse options and return index of first non-option argument (files).
+// Supports `--` to end option parsing.
 static int parse_flags(int argc, char **argv, FuzzyState *st) {
     int i = 1;
     for (; i < argc; i++) {
@@ -701,7 +583,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
             usage(argv[0]);
             return -1;
         } else {
-            break;
+            break; // first file arg
         }
     }
     return i;
@@ -721,13 +603,12 @@ int main(int argc, char **argv) {
     st->delimiter = '\0';
     st->query[0] = '\0';
     st->query_len = 0;
-    st->ssh_host[0] = '\0';
-    st->ssh_user[0] = '\0';
-
+    st->ssh_host[0]='\0';
+    st->ssh_user[0]='\0';
     int first_file_idx = parse_flags(argc, argv, st);
     if (first_file_idx < 0) {
         free(st);
-        return 0;
+        return 0; // help printed
     }
 
     st->scores = calloc(MAX_LINES, sizeof(int));
@@ -740,7 +621,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Load input
+    // Input mode:
+    // - If stdin is NOT a TTY => read from stdin (pipe)
+    // - If stdin IS a TTY => read from file args (if provided)
     if (!isatty(STDIN_FILENO)) {
         load_stdin(st);
     } else {
@@ -769,37 +652,50 @@ int main(int argc, char **argv) {
 
     update_matches(st);
 
-    // Open /dev/tty for interactive I/O
-    int tty_fd = open("/dev/tty", O_RDWR);
-    if (tty_fd < 0) {
-        fprintf(stderr, "nfzf: failed to open /dev/tty\n");
+    // Open controlling TTY for interactive UI even when stdin is a pipe.
+    FILE *tty_in  = fopen("/dev/tty", "r");
+    FILE *tty_out = fopen("/dev/tty", "w");
+    if (!tty_in || !tty_out) {
+        fprintf(stderr, "nfzf: failed to open /dev/tty for interactive input/output\n");
+        if (tty_in) fclose(tty_in);
+        if (tty_out) fclose(tty_out);
         free_state(st);
         free(st);
         return 1;
     }
 
-    // Redirect stdin/stdout to tty
-    int saved_stdin = dup(STDIN_FILENO);
-    int saved_stdout = dup(STDOUT_FILENO);
-    dup2(tty_fd, STDIN_FILENO);
-    dup2(tty_fd, STDOUT_FILENO);
-    close(tty_fd);
+    SCREEN *scr = newterm(NULL, tty_out, tty_in);
+    if (!scr) {
+        fprintf(stderr, "nfzf: newterm() failed\n");
+        fclose(tty_in);
+        fclose(tty_out);
+        free_state(st);
+        free(st);
+        return 1;
+    }
+    set_term(scr);
 
-    // Setup terminal
-    update_term_size();
-    
-    // Install signal handler for window resize
-    struct sigaction sa;
-    sa.sa_handler = sigwinch_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGWINCH, &sa, NULL);
+    // Make ESC feel snappy without breaking arrows (keypad handles sequences).
+    // Available on ncurses; if your platform lacks it, you can also set ESCDELAY env var.
+#if defined(NCURSES_VERSION)
+    set_escdelay(25);
+#endif
 
-    enable_raw_mode();
-    
-    write_str(CURSOR_HIDE);
-    write_str(CLEAR_SCREEN);
-    write_str(CURSOR_HOME);
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(0);
+    timeout(-1); // blocking
+
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+        init_pair(COLOR_NORMAL,   COLOR_WHITE,   -1);
+        init_pair(COLOR_SELECTED, COLOR_WHITE,   -1);
+        init_pair(COLOR_MATCH,    COLOR_YELLOW,  -1);
+        init_pair(COLOR_STATUS,   COLOR_WHITE,   -1);
+        init_pair(COLOR_QUERY,    COLOR_CYAN,    -1);
+    }
 
     int running = 1;
     int result = -1;
@@ -809,19 +705,10 @@ int main(int argc, char **argv) {
         result = handle_input(st, &running);
     }
 
-    // Cleanup
-    write_str(CLEAR_SCREEN);
-    write_str(CURSOR_HOME);
-    write_str(CURSOR_SHOW);
-    write_str(COLOR_RESET);
-    
-    disable_raw_mode();
-
-    // Restore original stdin/stdout
-    dup2(saved_stdin, STDIN_FILENO);
-    dup2(saved_stdout, STDOUT_FILENO);
-    close(saved_stdin);
-    close(saved_stdout);
+    endwin();
+    delscreen(scr);
+    fclose(tty_in);
+    fclose(tty_out);
 
     if (result >= 0 && result < st->match_count) {
         int line_idx = st->match_indices[result];

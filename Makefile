@@ -1,4 +1,4 @@
-# Makefile for nfzf (termios version)
+# Makefile for nfzf (ncurses version)
 
 CC := clang
 STRIP := strip
@@ -8,7 +8,7 @@ TARGET := nf
 BINDIR := bin
 
 CFLAGS := -Wall -Wextra -std=c99
-LDFLAGS :=
+LDFLAGS := -lncurses
 
 CFLAGS_DEBUG := -g -O0
 CFLAGS_RELEASE := -O2
@@ -76,6 +76,17 @@ clean:
 	rm -rf $(BINDIR)/$(TARGET)*
 	@echo "Cleaned"
 
+.PHONY: install
+install: release
+	@echo "Installing $(TARGET) to /usr/local/bin..."
+	install -m 755 $(BINDIR)/$(TARGET) /usr/local/bin/$(TARGET)
+	@echo "Installed successfully"
+
+.PHONY: uninstall
+uninstall:
+	rm -f /usr/local/bin/$(TARGET)
+	@echo "Uninstalled $(TARGET)"
+
 .PHONY: help
 help:
 	@echo "Targets:"
@@ -86,3 +97,5 @@ help:
 	@echo "  tiny          - Build with max optimization"
 	@echo "  compare       - Build all and compare sizes"
 	@echo "  clean         - Remove builds"
+	@echo "  install       - Install to /usr/local/bin"
+	@echo "  uninstall     - Remove from /usr/local/bin"
