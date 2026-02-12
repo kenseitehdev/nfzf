@@ -99,7 +99,7 @@ static void usage(const char *prog) {
 static char* strip_ansi(const char *str) {
     static char clean[MAX_LINE_LEN];
     int i = 0, j = 0;
-    
+
     while (str[i] && j < MAX_LINE_LEN - 1) {
         if (str[i] == '\033') {
             // Handle various ANSI escape sequences
@@ -269,7 +269,7 @@ static void load_directory(FuzzyState *st, const char *path) {
 
     struct dirent *entry;
     int skipped = 0;
-    
+
     while ((entry = readdir(dir)) != NULL) {
         if (st->line_count >= MAX_LINES) {
             skipped++;
@@ -278,20 +278,20 @@ static void load_directory(FuzzyState *st, const char *path) {
 
         // Always skip .
         if (strcmp(entry->d_name, ".") == 0) continue;
-        
+
         // Always show .. (parent directory)
         int is_parent = (strcmp(entry->d_name, "..") == 0);
-        
+
         // Skip hidden files if toggle is off (except ..)
         if (!st->show_hidden && !is_parent && entry->d_name[0] == '.') {
             continue;
         }
-        
+
         char full_path[PATH_MAX];
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        
+
         struct stat st_buf;
-        
+
         // Special handling for .. - always treat as directory
         if (is_parent) {
             add_line(st, "../");
@@ -312,9 +312,9 @@ static void load_directory(FuzzyState *st, const char *path) {
             }
         }
     }
-    
+
     closedir(dir);
-    
+
     if (skipped > 0) {
         fprintf(stderr, "Warning: %d entries skipped (MAX_LINES reached)\n", skipped);
     }
@@ -443,7 +443,7 @@ static void draw_status_bar(FuzzyState *st) {
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 
     // Start with NBL NFZF
-    mvprintw(max_y - 1, 1, "NBL NFZF | ");
+    mvprintw(max_y - 1, 1, "NBL FF | ");
     int nbl_len = 11;  // "NBL NFZF | " length
 
     // Determine mode string and color
@@ -660,29 +660,29 @@ static void clear_query(FuzzyState *st) {
 
 static void toggle_hidden_files(FuzzyState *st) {
     if (!st->is_directory_mode) return;
-    
+
     st->show_hidden = !st->show_hidden;
-    
+
     // Clear query to show all files after toggle
     st->query[0] = '\0';
     st->query_len = 0;
-    
+
     load_directory(st, st->current_dir);
     update_matches(st);
-    
+
     // Ensure we're at the top after reload
     st->selected = 0;
     st->scroll_offset = 0;
-    
+
     // Clear screen to make the change obvious
     clear();
 }
 
 static void navigate_directory(FuzzyState *st, const char *selection) {
     if (!st->is_directory_mode) return;
-    
+
     char new_path[PATH_MAX];
-    
+
     // Handle parent directory (..)
     if (strcmp(selection, "../") == 0 || strcmp(selection, "..") == 0) {
         // Get parent directory
@@ -701,7 +701,7 @@ static void navigate_directory(FuzzyState *st, const char *selection) {
         char dirname[MAX_LINE_LEN];
         strncpy(dirname, selection, sizeof(dirname) - 1);
         dirname[strlen(dirname) - 1] = '\0';
-        
+
         // Build new path
         snprintf(new_path, sizeof(new_path), "%s/%s", st->current_dir, dirname);
     }
@@ -710,15 +710,15 @@ static void navigate_directory(FuzzyState *st, const char *selection) {
         // Regular file or executable - don't navigate, just return it
         return;
     }
-    
+
     // Update current directory and reload
     strncpy(st->current_dir, new_path, PATH_MAX - 1);
     st->current_dir[PATH_MAX - 1] = '\0';
-    
+
     // Clear query when navigating
     st->query[0] = '\0';
     st->query_len = 0;
-    
+
     // Reload directory
     load_directory(st, st->current_dir);
     update_matches(st);
@@ -765,9 +765,9 @@ static int handle_input(FuzzyState *st, int *running) {
                     // Get selected line
                     int line_idx = st->match_indices[st->selected];
                     const char *selection = st->lines[line_idx];
-                    
+
                     // Check if it's a directory
-                    if (selection[strlen(selection) - 1] == '/' || 
+                    if (selection[strlen(selection) - 1] == '/' ||
                         strcmp(selection, "..") == 0) {
                         navigate_directory(st, selection);
                         break;  // Don't exit, stay in the browser
@@ -833,9 +833,9 @@ static int handle_input(FuzzyState *st, int *running) {
                     // Get selected line
                     int line_idx = st->match_indices[st->selected];
                     const char *selection = st->lines[line_idx];
-                    
+
                     // Check if it's a directory
-                    if (selection[strlen(selection) - 1] == '/' || 
+                    if (selection[strlen(selection) - 1] == '/' ||
                         strcmp(selection, "..") == 0) {
                         navigate_directory(st, selection);
                         break;  // Don't exit, stay in the browser
@@ -1046,17 +1046,17 @@ int main(int argc, char **argv) {
     if (result >= 0 && result < st->match_count) {
         int line_idx = st->match_indices[result];
         const char *selected = st->lines[line_idx];
-        
+
         // Strip trailing / or * markers for output
         char output[MAX_LINE_LEN];
         strncpy(output, selected, sizeof(output) - 1);
         output[sizeof(output) - 1] = '\0';
-        
+
         size_t len = strlen(output);
         if (len > 0 && (output[len - 1] == '/' || output[len - 1] == '*')) {
             output[len - 1] = '\0';
         }
-        
+
         // In directory mode, output full path
         if (st->is_directory_mode) {
             // Don't include .. in the full path output
