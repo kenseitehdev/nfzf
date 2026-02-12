@@ -4,7 +4,7 @@ CC := clang
 STRIP := strip
 
 SRC := src/main.c
-TARGET := nf
+TARGET := ff
 BINDIR := bin
 
 CFLAGS := -Wall -Wextra -std=c99

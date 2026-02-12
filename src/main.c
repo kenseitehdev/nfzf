@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <strings.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <limits.h>
 
 #define MAX_LINES 100000
 #define MAX_LINE_LEN 2048
@@ -21,6 +23,12 @@
 #define COLOR_MATCH      3
 #define COLOR_STATUS     4
 #define COLOR_QUERY      5
+#define COLOR_EXECUTABLE 6
+
+typedef enum {
+    MODE_NORMAL,
+    MODE_INSERT
+} Mode;
 
 typedef struct {
     char *lines[MAX_LINES];
@@ -38,6 +46,10 @@ typedef struct {
     int preview_enabled;
     char ssh_host[256];
     char ssh_user[256];
+    Mode mode;
+    char current_dir[PATH_MAX];
+    int is_directory_mode;
+    int show_hidden;
 } FuzzyState;
 
 static void usage(const char *prog) {
@@ -46,6 +58,7 @@ static void usage(const char *prog) {
         "  %s [OPTIONS] < file\n"
         "  cmd | %s [OPTIONS]\n"
         "  %s [OPTIONS] file1 [file2 ...]\n"
+        "  %s [OPTIONS] -D [directory]\n"
         "\n"
         "Options:\n"
         "  -h, --help          Show this help\n"
@@ -53,21 +66,52 @@ static void usage(const char *prog) {
         "  -s                  Case-sensitive matching\n"
         "  -e                  Exact match mode\n"
         "  -d DELIM            Use delimiter for multi-column display\n"
+        "  -D [DIR]            Directory browsing mode (default: current dir)\n"
         "\n"
         "Keybindings:\n"
-        "  j/k, Down/Up        Move selection\n"
+        "  i                   Enter INSERT mode (type to filter)\n"
+        "  ESC                 Enter NORMAL mode / Exit\n"
+        "  j/k, Down/Up        Move selection (NORMAL mode)\n"
         "  Ctrl+D/Ctrl+U       Half-page down/up\n"
         "  g/G                 Jump to top/bottom\n"
-        "  Enter               Select and exit\n"
-        "  Ctrl+C, Esc, q      Exit without selection\n"
-        "  Type to filter      Fuzzy search\n"
-        "  Backspace           Delete character\n"
-        "  Ctrl+W              Delete word\n"
+        "  h                   Go to parent directory (directory mode)\n"
+        "  .                   Toggle hidden files (directory mode, works when filter empty)\n"
+        "  Enter               Select file / Navigate into directory\n"
+        "  Ctrl+C, q           Exit without selection (NORMAL mode)\n"
+        "  Backspace           Delete character (INSERT mode)\n"
+        "  Ctrl+W              Delete word (INSERT mode)\n"
         "  Ctrl+L              Clear query\n"
         "\n"
-        "Reads lines from stdin (pipe) OR from file arguments.\n",
-        prog, prog, prog
+        "Modes:\n"
+        "  NORMAL              Navigate with j/k, press 'i' to filter\n"
+        "  INSERT              Type to filter, ESC to return to NORMAL\n"
+        "\n"
+        "Directory Mode Visual Indicators:\n"
+        "  filename/           Directory\n"
+        "  filename*           Executable file\n"
+        "  filename            Regular file\n"
+        "\n"
+        "Reads lines from stdin (pipe) OR from file arguments OR browse directory.\n",
+        prog, prog, prog, prog
     );
+}
+
+static char* strip_ansi(const char *str) {
+    static char clean[MAX_LINE_LEN];
+    int i = 0, j = 0;
+
+    while (str[i] && j < MAX_LINE_LEN - 1) {
+        if (str[i] == '\033' && str[i+1] == '[') {
+            // Skip ANSI escape sequence
+            i += 2;
+            while (str[i] && !isalpha((unsigned char)str[i])) i++;
+            if (str[i]) i++;  // Skip the letter
+        } else {
+            clean[j++] = str[i++];
+        }
+    }
+    clean[j] = '\0';
+    return clean;
 }
 
 static int fuzzy_score(const char *needle, const char *haystack, int case_sensitive) {
@@ -165,7 +209,8 @@ static void add_line(FuzzyState *st, const char *s) {
     if (st->line_count >= MAX_LINES) return;
     if (!s || !*s) return;
 
-    st->lines[st->line_count++] = strdup(s);
+    const char *clean = strip_ansi(s);
+    st->lines[st->line_count++] = strdup(clean);
 }
 
 static void load_stream(FuzzyState *st, FILE *fp) {
@@ -179,6 +224,74 @@ static void load_stream(FuzzyState *st, FILE *fp) {
         add_line(st, line);
     }
 }
+
+static void load_directory(FuzzyState *st, const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        fprintf(stderr, "Failed to open directory: %s\n", path);
+        return;
+    }
+
+    // Clear existing lines for reload
+    for (int i = 0; i < st->line_count; i++) {
+        free(st->lines[i]);
+        st->lines[i] = NULL;
+    }
+    st->line_count = 0;
+
+    struct dirent *entry;
+    int skipped = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (st->line_count >= MAX_LINES) {
+            skipped++;
+            continue;
+        }
+
+        // Always skip .
+        if (strcmp(entry->d_name, ".") == 0) continue;
+
+        // Always show .. (parent directory)
+        int is_parent = (strcmp(entry->d_name, "..") == 0);
+
+        // Skip hidden files if toggle is off (except ..)
+        if (!st->show_hidden && !is_parent && entry->d_name[0] == '.') {
+            continue;
+        }
+
+        char full_path[PATH_MAX];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+
+        struct stat st_buf;
+
+        // Special handling for .. - always treat as directory
+        if (is_parent) {
+            add_line(st, "../");
+        } else if (stat(full_path, &st_buf) == 0) {
+            if (S_ISDIR(st_buf.st_mode)) {
+                char dir_entry[MAX_LINE_LEN];
+                snprintf(dir_entry, sizeof(dir_entry), "%s/", entry->d_name);
+                add_line(st, dir_entry);
+            } else {
+                // Check if file is executable
+                if (st_buf.st_mode & S_IXUSR) {
+                    char exec_entry[MAX_LINE_LEN];
+                    snprintf(exec_entry, sizeof(exec_entry), "%s*", entry->d_name);
+                    add_line(st, exec_entry);
+                } else {
+                    add_line(st, entry->d_name);
+                }
+            }
+        }
+    }
+
+    closedir(dir);
+
+    if (skipped > 0) {
+        fprintf(stderr, "Warning: %d entries skipped (MAX_LINES reached)\n", skipped);
+    }
+}
+
 static int parse_ssh_path(const char *path, char *user, char *host, char *remote_path) {
     if (!strchr(path, ':')) return 0;  // Not an SSH path
 
@@ -208,7 +321,7 @@ static int parse_ssh_path(const char *path, char *user, char *host, char *remote
     return 1;
 }
 
-// NEW: Execute command via SSH and capture output
+// Execute command via SSH and capture output
 static FILE *ssh_popen(const char *user, const char *host, const char *command) {
     char ssh_cmd[2048];
 
@@ -221,7 +334,7 @@ static FILE *ssh_popen(const char *user, const char *host, const char *command) 
     return popen(ssh_cmd, "r");
 }
 
-// NEW: Load file content from SSH
+// Load file content from SSH
 static int load_ssh_file(FuzzyState *st, const char *path) {
     char user[256], host[256], remote_path[256];
 
@@ -247,6 +360,7 @@ static int load_ssh_file(FuzzyState *st, const char *path) {
     pclose(fp);
     return 1;
 }
+
 static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
     for (int i = first_file_idx; i < argc; i++) {
@@ -280,7 +394,9 @@ static void load_stdin(FuzzyState *st) {
 }
 
 static void free_state(FuzzyState *st) {
-    for (int i = 0; i < st->line_count; i++) free(st->lines[i]);
+    for (int i = 0; i < st->line_count; i++) {
+        if (st->lines[i]) free(st->lines[i]);
+    }
     free(st->scores);
     free(st->match_indices);
 }
@@ -298,20 +414,55 @@ static void draw_status_bar(FuzzyState *st) {
 
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 
+    // Start with NBL NFZF
+    mvprintw(max_y - 1, 1, "NBL FF | ");
+    int nbl_len = 11;  // "NBL NFZF | " length
+
+    // Determine mode string and color
+    const char *mode_str;
+    int mode_color;
+    if (st->mode == MODE_INSERT) {
+        mode_str = "INSERT";
+        mode_color = COLOR_QUERY;  // Cyan/distinctive color
+    } else {
+        mode_str = "NORMAL";
+        mode_color = COLOR_MATCH;  // Yellow/distinctive color
+    }
+
+    // Draw mode indicator after NBL NFZF
+    attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+    attron(COLOR_PAIR(mode_color) | A_BOLD);
+    mvprintw(max_y - 1, nbl_len, "[%s]", mode_str);
+    attroff(COLOR_PAIR(mode_color) | A_BOLD);
+    attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+
+    // Calculate position after mode indicator
+    int mode_len = (int)strlen(mode_str) + 3;  // [MODE] = mode + 2 brackets + space
+    int status_start = nbl_len + mode_len;
+
     char left[256];
-    snprintf(left, sizeof(left), "NBL NFZF | %d/%d matches | Mode: %s%s",
+    snprintf(left, sizeof(left), " | %d/%d matches | Mode: %s%s%s%s",
              st->match_count > 0 ? st->selected + 1 : 0,
              st->match_count,
              st->exact_match ? "EXACT" : "FUZZY",
-             st->case_sensitive ? " (case)" : "");
+             st->case_sensitive ? " (case)" : "",
+             st->show_hidden ? " | hidden" : "",
+             st->is_directory_mode ? " | dir" : "");
 
-    mvprintw(max_y - 1, 1, "%s", left);
+    mvprintw(max_y - 1, status_start, "%s", left);
 
     if (st->query_len > 0) {
         char right[300];
         snprintf(right, sizeof(right), "Query: %s ", st->query);
         int rx = max_x - (int)strlen(right) - 1;
-        if (rx < 1) rx = 1;
+        if (rx < status_start) rx = status_start;
+        mvprintw(max_y - 1, rx, "%s", right);
+    } else if (st->is_directory_mode) {
+        // Show current directory when no query
+        char right[300];
+        snprintf(right, sizeof(right), "Dir: %s ", st->current_dir);
+        int rx = max_x - (int)strlen(right) - 1;
+        if (rx < status_start) rx = status_start;
         mvprintw(max_y - 1, rx, "%s", right);
     }
 
@@ -376,10 +527,13 @@ static void draw_results(FuzzyState *st) {
         const char *line = st->lines[line_idx];
 
         int is_selected = (match_idx == st->selected);
+        int is_executable = (strlen(line) > 0 && line[strlen(line) - 1] == '*');
 
         if (is_selected) {
             attron(COLOR_PAIR(COLOR_SELECTED) | A_REVERSE | A_BOLD);
             mvhline(i, 0, ' ', max_x);
+        } else if (is_executable) {
+            attron(COLOR_PAIR(COLOR_EXECUTABLE));
         }
 
         mvprintw(i, 1, is_selected ? "> " : "  ");
@@ -387,6 +541,8 @@ static void draw_results(FuzzyState *st) {
 
         if (is_selected) {
             attroff(COLOR_PAIR(COLOR_SELECTED) | A_REVERSE | A_BOLD);
+        } else if (is_executable) {
+            attroff(COLOR_PAIR(COLOR_EXECUTABLE));
         }
     }
 }
@@ -474,11 +630,74 @@ static void clear_query(FuzzyState *st) {
     update_matches(st);
 }
 
+static void toggle_hidden_files(FuzzyState *st) {
+    if (!st->is_directory_mode) return;
+
+    st->show_hidden = !st->show_hidden;
+
+    // Clear query to show all files after toggle
+    st->query[0] = '\0';
+    st->query_len = 0;
+
+    load_directory(st, st->current_dir);
+    update_matches(st);
+
+    // Ensure we're at the top after reload
+    st->selected = 0;
+    st->scroll_offset = 0;
+
+    // Clear screen to make the change obvious
+    clear();
+}
+
+static void navigate_directory(FuzzyState *st, const char *selection) {
+    if (!st->is_directory_mode) return;
+
+    char new_path[PATH_MAX];
+
+    // Handle parent directory (..)
+    if (strcmp(selection, "../") == 0 || strcmp(selection, "..") == 0) {
+        // Get parent directory
+        char *last_slash = strrchr(st->current_dir, '/');
+        if (last_slash && last_slash != st->current_dir) {
+            *last_slash = '\0';  // Truncate to parent
+            strncpy(new_path, st->current_dir, PATH_MAX - 1);
+            *last_slash = '/';  // Restore for copy
+        } else {
+            strncpy(new_path, "/", PATH_MAX - 1);
+        }
+    }
+    // Handle subdirectory (ends with /)
+    else if (selection[strlen(selection) - 1] == '/') {
+        // Remove trailing /
+        char dirname[MAX_LINE_LEN];
+        strncpy(dirname, selection, sizeof(dirname) - 1);
+        dirname[strlen(dirname) - 1] = '\0';
+
+        // Build new path
+        snprintf(new_path, sizeof(new_path), "%s/%s", st->current_dir, dirname);
+    }
+    // Handle executable (ends with *) or regular file
+    else {
+        // Regular file or executable - don't navigate, just return it
+        return;
+    }
+
+    // Update current directory and reload
+    strncpy(st->current_dir, new_path, PATH_MAX - 1);
+    st->current_dir[PATH_MAX - 1] = '\0';
+
+    // Clear query when navigating
+    st->query[0] = '\0';
+    st->query_len = 0;
+
+    // Reload directory
+    load_directory(st, st->current_dir);
+    update_matches(st);
+}
+
 static void handle_resize(FuzzyState *st) {
-    // Let ncurses update its idea of the terminal size.
-    // resizeterm(0,0) asks ncurses to query the new size.
     resizeterm(0, 0);
-    // Ensure selection visibility under new viewport height.
     ensure_visible(st);
     clear();
     draw_ui(st);
@@ -489,68 +708,137 @@ static int handle_input(FuzzyState *st, int *running) {
 
     switch (ch) {
         case ERR:
-            // Shouldn’t happen in blocking mode, but safe to ignore.
             return -2;
 
         case KEY_RESIZE:
             handle_resize(st);
-            break;
+            return -2;
+    }
 
-        case 'q':
-        case 3:   // Ctrl+C
-        case 27:  // ESC
-            *running = 0;
-            return -1;
+    if (st->mode == MODE_NORMAL) {
+        switch (ch) {
+            case 'i':
+                st->mode = MODE_INSERT;
+                break;
 
-        case '\n':
-        case '\r':
-        case KEY_ENTER:
-            *running = 0;
-            return st->selected;
+            case 'q':
+            case 3:   // Ctrl+C
+                *running = 0;
+                return -1;
 
-        case 'j':
-        case KEY_DOWN:
-            move_down(st);
-            break;
+            case 27:  // ESC
+                *running = 0;
+                return -1;
 
-        case 'k':
-        case KEY_UP:
-            move_up(st);
-            break;
+            case '\n':
+            case '\r':
+            case KEY_ENTER:
+                if (st->is_directory_mode && st->match_count > 0) {
+                    // Get selected line
+                    int line_idx = st->match_indices[st->selected];
+                    const char *selection = st->lines[line_idx];
 
-        case 4:  // Ctrl+D
-            page_down(st);
-            break;
+                    // Check if it's a directory
+                    if (selection[strlen(selection) - 1] == '/' ||
+                        strcmp(selection, "..") == 0) {
+                        navigate_directory(st, selection);
+                        break;  // Don't exit, stay in the browser
+                    }
+                }
+                *running = 0;
+                return st->selected;
 
-        case 21: // Ctrl+U
-            page_up(st);
-            break;
+            case 'j':
+            case KEY_DOWN:
+                move_down(st);
+                break;
 
-        case 12: // Ctrl+L
-            clear_query(st);
-            break;
+            case 'k':
+            case KEY_UP:
+                move_up(st);
+                break;
 
-        case 'g':
-            jump_top(st);
-            break;
+            case 4:  // Ctrl+D
+                page_down(st);
+                break;
 
-        case 'G':
-            jump_bottom(st);
-            break;
+            case 21: // Ctrl+U
+                page_up(st);
+                break;
 
-        case KEY_BACKSPACE:
-        case 127:
-        case 8:
-            delete_char(st);
-            break;
+            case 12: // Ctrl+L
+                clear_query(st);
+                break;
 
-        case 23: // Ctrl+W
-            delete_word(st);
-            break;
+            case 'g':
+                jump_top(st);
+                break;
 
-        default:
-            if (isprint(ch)) add_char(st, (char)ch);
-            break;
+            case 'G':
+                jump_bottom(st);
+                break;
+
+            case '.':
+                toggle_hidden_files(st);
+                break;
+
+            case 'h':
+                // Go to parent directory
+                if (st->is_directory_mode) {
+                    navigate_directory(st, "..");
+                }
+                break;
+
+            default:
+                break;
+        }
+    } else {  // MODE_INSERT
+        switch (ch) {
+            case 27:  // ESC
+                st->mode = MODE_NORMAL;
+                break;
+
+            case '\n':
+            case '\r':
+            case KEY_ENTER:
+                if (st->is_directory_mode && st->match_count > 0) {
+                    // Get selected line
+                    int line_idx = st->match_indices[st->selected];
+                    const char *selection = st->lines[line_idx];
+
+                    // Check if it's a directory
+                    if (selection[strlen(selection) - 1] == '/' ||
+                        strcmp(selection, "..") == 0) {
+                        navigate_directory(st, selection);
+                        break;  // Don't exit, stay in the browser
+                    }
+                }
+                *running = 0;
+                return st->selected;
+
+            case KEY_BACKSPACE:
+            case 127:
+            case 8:
+                delete_char(st);
+                break;
+
+            case 23: // Ctrl+W
+                delete_word(st);
+                break;
+
+            case 12: // Ctrl+L
+                clear_query(st);
+                break;
+
+            default:
+                if (ch == '.' && st->is_directory_mode && st->query_len == 0) {
+                    // If in directory mode and query is empty, toggle hidden files
+                    toggle_hidden_files(st);
+                } else if (isprint(ch)) {
+                    add_char(st, (char)ch);
+                }
+                break;
+        }
     }
 
     return -2;
@@ -578,6 +866,16 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
                 fprintf(stderr, "Error: -d requires an argument\n");
                 return -1;
             }
+        } else if (strcmp(argv[i], "-D") == 0) {
+            st->is_directory_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                strncpy(st->current_dir, argv[++i], PATH_MAX - 1);
+            } else {
+                if (!getcwd(st->current_dir, PATH_MAX)) {
+                    fprintf(stderr, "Error: failed to get current directory\n");
+                    return -1;
+                }
+            }
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -603,8 +901,13 @@ int main(int argc, char **argv) {
     st->delimiter = '\0';
     st->query[0] = '\0';
     st->query_len = 0;
-    st->ssh_host[0]='\0';
-    st->ssh_user[0]='\0';
+    st->ssh_host[0] = '\0';
+    st->ssh_user[0] = '\0';
+    st->mode = MODE_NORMAL;  // Start in NORMAL mode
+    st->is_directory_mode = 0;
+    st->show_hidden = 0;
+    st->current_dir[0] = '\0';
+
     int first_file_idx = parse_flags(argc, argv, st);
     if (first_file_idx < 0) {
         free(st);
@@ -622,9 +925,12 @@ int main(int argc, char **argv) {
     }
 
     // Input mode:
+    // - If directory mode (-D) => load directory
     // - If stdin is NOT a TTY => read from stdin (pipe)
     // - If stdin IS a TTY => read from file args (if provided)
-    if (!isatty(STDIN_FILENO)) {
+    if (st->is_directory_mode) {
+        load_directory(st, st->current_dir);
+    } else if (!isatty(STDIN_FILENO)) {
         load_stdin(st);
     } else {
         if (first_file_idx >= argc) {
@@ -675,8 +981,6 @@ int main(int argc, char **argv) {
     }
     set_term(scr);
 
-    // Make ESC feel snappy without breaking arrows (keypad handles sequences).
-    // Available on ncurses; if your platform lacks it, you can also set ESCDELAY env var.
 #if defined(NCURSES_VERSION)
     set_escdelay(25);
 #endif
@@ -690,11 +994,12 @@ int main(int argc, char **argv) {
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(COLOR_NORMAL,   COLOR_WHITE,   -1);
-        init_pair(COLOR_SELECTED, COLOR_WHITE,   -1);
-        init_pair(COLOR_MATCH,    COLOR_YELLOW,  -1);
-        init_pair(COLOR_STATUS,   COLOR_WHITE,   -1);
-        init_pair(COLOR_QUERY,    COLOR_CYAN,    -1);
+        init_pair(COLOR_NORMAL,     COLOR_WHITE,   -1);
+        init_pair(COLOR_SELECTED,   COLOR_WHITE,   -1);
+        init_pair(COLOR_MATCH,      COLOR_YELLOW,  -1);
+        init_pair(COLOR_STATUS,     COLOR_WHITE,   -1);
+        init_pair(COLOR_QUERY,      COLOR_CYAN,    -1);
+        init_pair(COLOR_EXECUTABLE, COLOR_GREEN,   -1);
     }
 
     int running = 1;
@@ -712,7 +1017,19 @@ int main(int argc, char **argv) {
 
     if (result >= 0 && result < st->match_count) {
         int line_idx = st->match_indices[result];
-        printf("%s\n", st->lines[line_idx]);
+        const char *selected = st->lines[line_idx];
+
+        // Strip trailing / or * markers for output
+        char output[MAX_LINE_LEN];
+        strncpy(output, selected, sizeof(output) - 1);
+        output[sizeof(output) - 1] = '\0';
+
+        size_t len = strlen(output);
+        if (len > 0 && (output[len - 1] == '/' || output[len - 1] == '*')) {
+            output[len - 1] = '\0';
+        }
+
+        printf("%s\n", output);
     }
 
     free_state(st);
