@@ -405,35 +405,56 @@ static void load_directory(FuzzyState *st, const char *path) {
     }
 }
 
-static int parse_ssh_path(const char *path, char *user, char *host, char *remote_path) {
-    if (!strchr(path, ':')) return 0;  // Not an SSH path
+#include <string.h>
+#include <stddef.h>
 
+static int parse_ssh_path(const char *path, char *user, size_t user_size, 
+                          char *host, size_t host_size, 
+                          char *remote_path, size_t remote_path_size) {
+    if (!path || !user || !host || !remote_path) return 0;
+    
+    const char *colon = strchr(path, ':');
+    if (!colon) return 0;  // Not an SSH path
+    
+    size_t userhost_len = colon - path;
+    if (userhost_len >= 1024) return 0;  // Path too long
+    
     char temp[1024];
-    strncpy(temp, path, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = '\0';
-
-    char *colon = strchr(temp, ':');
-    if (!colon) return 0;
-
-    *colon = '\0';
-    char *userhost = temp;
-    char *rpath = colon + 1;
-
+    memcpy(temp, path, userhost_len);
+    temp[userhost_len] = '\0';
+    
+    const char *rpath = colon + 1;
+    
     // Parse user@host or just host
-    char *at = strchr(userhost, '@');
+    const char *at = strchr(temp, '@');
     if (at) {
-        *at = '\0';
-        strncpy(user, userhost, 255);
-        strncpy(host, at + 1, 255);
+        size_t user_len = at - temp;
+        size_t host_len = userhost_len - user_len - 1;
+        
+        if (user_len >= user_size || host_len >= host_size) return 0;
+        
+        memcpy(user, temp, user_len);
+        user[user_len] = '\0';
+        
+        memcpy(host, at + 1, host_len);
+        host[host_len] = '\0';
     } else {
+        if (userhost_len >= host_size) return 0;
+        
         user[0] = '\0';  // No user specified
-        strncpy(host, userhost, 255);
+        memcpy(host, temp, userhost_len);
+        host[userhost_len] = '\0';
     }
-
-    strncpy(remote_path, rpath, 255);
+    
+    // Copy remote path with bounds checking
+    size_t rpath_len = strlen(rpath);
+    if (rpath_len >= remote_path_size) return 0;
+    
+    memcpy(remote_path, rpath, rpath_len);
+    remote_path[rpath_len] = '\0';
+    
     return 1;
 }
-
 // Execute command via SSH and capture output
 static FILE *ssh_popen(const char *user, const char *host, const char *command) {
     char ssh_cmd[2048];
@@ -525,10 +546,9 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
 static int load_ssh_file(FuzzyState *st, const char *path) {
     char user[256], host[256], remote_path[256];
 
-    if (!parse_ssh_path(path, user, host, remote_path)) {
-        return 0;  // Not an SSH path
-    }
-
+if (!parse_ssh_path(path, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
+    return 0;  // Not an SSH path
+}
     // Save SSH info for potential later use
     strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
@@ -1056,7 +1076,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
     int i = 1;
     for (; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { i++; break; }
-
+        
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return -1;
@@ -1079,7 +1099,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
                 
                 // Check if it's an SSH path
                 char user[256], host[256], remote_path[256];
-                if (parse_ssh_path(dir_arg, user, host, remote_path)) {
+                if (parse_ssh_path(dir_arg, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
                     // SSH directory mode
                     st->ssh_mode = 1;
                     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
@@ -1106,7 +1126,6 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
     }
     return i;
 }
-
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
 
