@@ -1,5 +1,6 @@
 // ff - NBL Fuzzy Filter (with SSH directory browsing)
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE  // Add this line for macOS qsort_r
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,7 +242,13 @@ static int fuzzy_score(const char *needle, const char *haystack, int case_sensit
                 score += 1;
 
                 if (n_idx > 0 && h_idx > 0 && consecutive > 0) {
-                    score += 5 * consecutive;
+                    // Cap consecutive bonus to prevent overflow
+                    int bonus = 5 * consecutive;
+                    if (score > INT_MAX - bonus) {
+                        score = INT_MAX;  // Cap at max
+                    } else {
+                        score += bonus;
+                    }
                 }
                 consecutive++;
 
@@ -249,7 +256,11 @@ static int fuzzy_score(const char *needle, const char *haystack, int case_sensit
                     haystack[h_idx - 1] == ' ' ||
                     haystack[h_idx - 1] == '/' ||
                     haystack[h_idx - 1] == '_') {
-                    score += 10;
+                    if (score <= INT_MAX - 10) {
+                        score += 10;
+                    } else {
+                        score = INT_MAX;
+                    }
                 }
 
                 h_idx++;
@@ -265,7 +276,6 @@ static int fuzzy_score(const char *needle, const char *haystack, int case_sensit
     score -= (h_len - n_len);
     return score;
 }
-
 static int compare_scores(const void *a, const void *b, void *state) {
     FuzzyState *st = (FuzzyState*)state;
     int idx_a = *(const int*)a;
@@ -282,11 +292,21 @@ static int compare_scores_static(const void *a, const void *b) {
     return compare_scores(a, b, g_sort_ctx);
 }
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+// BSD-style qsort_r
+static int compare_scores_bsd(void *state, const void *a, const void *b) {
+    return compare_scores(a, b, state);
+}
+#elif defined(__linux__) || defined(_GNU_SOURCE)
+// GNU-style qsort_r
+static int compare_scores_gnu(const void *a, const void *b, void *state) {
+    return compare_scores(a, b, state);
+}
+#endif
 
 static void update_matches(FuzzyState *st) {
     st->match_count = 0;
 
-    // If query is empty, show everything in original order
     if (st->query_len == 0) {
         for (int i = 0; i < st->line_count; i++) {
             st->scores[i] = 1000;
@@ -299,21 +319,26 @@ static void update_matches(FuzzyState *st) {
 
     for (int i = 0; i < st->line_count; i++) {
         int score;
-
         if (st->exact_match) {
             const char *found = strstr(st->lines[i], st->query);
             score = found ? 1000 : -1;
         } else {
             score = fuzzy_score(st->query, st->lines[i], st->case_sensitive);
         }
-
         st->scores[i] = score;
         if (score >= 0) st->match_indices[st->match_count++] = i;
     }
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    qsort_r(st->match_indices, st->match_count, sizeof(int), st, compare_scores_bsd);
+#elif defined(__linux__) || defined(_GNU_SOURCE)
+    qsort_r(st->match_indices, st->match_count, sizeof(int), compare_scores_gnu, st);
+#else
+    // Fallback to unsafe version if qsort_r not available
     g_sort_ctx = st;
     qsort(st->match_indices, st->match_count, sizeof(int), compare_scores_static);
     g_sort_ctx = NULL;
+#endif
 
     st->selected = 0;
     st->scroll_offset = 0;
@@ -321,15 +346,40 @@ static void update_matches(FuzzyState *st) {
 static void add_line(FuzzyState *st, const char *s) {
     if (st->line_count >= MAX_LINES) return;
     if (!s || !*s) return;
-char clean[MAX_LINE_LEN];
-strip_ansi(s, clean, sizeof(clean));
-st->lines[st->line_count++] = strdup(clean);
+    
+    size_t s_len = strlen(s);
+    if (s_len >= MAX_LINE_LEN) {
+        fprintf(stderr, "Warning: line too long (%zu bytes), truncating\n", s_len);
+    }
+    
+    char clean[MAX_LINE_LEN];
+    if (strip_ansi(s, clean, sizeof(clean)) < 0) {
+        // Truncation occurred, but we still use what we got
+    }
+    
+    char *duplicated = strdup(clean);
+    if (!duplicated) {
+        fprintf(stderr, "Warning: failed to allocate memory for line\n");
+        return;
+    }
+    
+    st->lines[st->line_count++] = duplicated;
 }
-
 static void load_stream(FuzzyState *st, FILE *fp) {
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), fp) && st->line_count < MAX_LINES) {
         size_t len = strlen(line);
+        
+        // Check if line was truncated (no newline and buffer full)
+        if (len > 0 && len == MAX_LINE_LEN - 1 && line[len - 1] != '\n') {
+            // Line was too long, consume rest of line
+            int ch;
+            while ((ch = fgetc(fp)) != EOF && ch != '\n') {
+                // Discard remaining characters
+            }
+            fprintf(stderr, "Warning: line truncated (exceeds %d bytes)\n", MAX_LINE_LEN);
+        }
+        
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
         }
@@ -337,7 +387,6 @@ static void load_stream(FuzzyState *st, FILE *fp) {
         add_line(st, line);
     }
 }
-
 static void load_directory(FuzzyState *st, const char *path) {
     DIR *dir = opendir(path);
     if (!dir) {
@@ -457,12 +506,24 @@ static int parse_ssh_path(const char *path, char *user, size_t user_size,
 }
 // Execute command via SSH and capture output
 static FILE *ssh_popen(const char *user, const char *host, const char *command) {
+    if (!host || !host[0] || !command || !command[0]) {
+        return NULL;
+    }
+    
     char ssh_cmd[2048];
+    int written;
 
     if (user && user[0]) {
-        snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh %s@%s '%s'", user, host, command);
+        written = snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh -o ConnectTimeout=10 -o BatchMode=yes %s@%s '%s' 2>&1", 
+                          user, host, command);
     } else {
-        snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh %s '%s'", host, command);
+        written = snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh -o ConnectTimeout=10 -o BatchMode=yes %s '%s' 2>&1", 
+                          host, command);
+    }
+    
+    if (written < 0 || written >= (int)sizeof(ssh_cmd)) {
+        fprintf(stderr, "SSH command too long\n");
+        return NULL;
     }
 
     return popen(ssh_cmd, "r");
@@ -470,6 +531,11 @@ static FILE *ssh_popen(const char *user, const char *host, const char *command) 
 
 // Load remote directory listing via SSH
 static void load_ssh_directory(FuzzyState *st, const char *path) {
+    if (!path || !path[0]) {
+        fprintf(stderr, "Invalid remote path\n");
+        return;
+    }
+    
     // Clear existing lines
     for (int i = 0; i < st->line_count; i++) {
         free(st->lines[i]);
@@ -478,25 +544,27 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
     st->line_count = 0;
 
     // Build ls command with options
-    // -A: show hidden files (except . and ..)
-    // -p: append / to directories
-    // -1: one entry per line
-    // --color=never: no color codes
     char ls_cmd[1024];
+    int written;
     if (st->show_hidden) {
-        snprintf(ls_cmd, sizeof(ls_cmd), 
-                "cd '%s' && ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null", 
+        written = snprintf(ls_cmd, sizeof(ls_cmd), 
+                "cd '%s' 2>/dev/null && ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null", 
                 path);
     } else {
-        snprintf(ls_cmd, sizeof(ls_cmd), 
-                "cd '%s' && ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null", 
+        written = snprintf(ls_cmd, sizeof(ls_cmd), 
+                "cd '%s' 2>/dev/null && ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null", 
                 path);
+    }
+    
+    if (written < 0 || written >= (int)sizeof(ls_cmd)) {
+        fprintf(stderr, "Directory path too long\n");
+        return;
     }
 
     FILE *fp = ssh_popen(st->ssh_user, st->ssh_host, ls_cmd);
     if (!fp) {
-        fprintf(stderr, "Failed to list remote directory: %s@%s:%s\n", 
-                st->ssh_user, st->ssh_host, path);
+        fprintf(stderr, "Failed to connect to %s@%s\n", 
+                st->ssh_user[0] ? st->ssh_user : "ssh", st->ssh_host);
         return;
     }
 
@@ -510,6 +578,15 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
         
         // Skip . entry
         if (strcmp(line, ".") == 0) continue;
+        
+        // Check for SSH error messages
+        if (strncmp(line, "Permission denied", 17) == 0 ||
+            strncmp(line, "Connection refused", 18) == 0 ||
+            strncmp(line, "Host key verification failed", 28) == 0) {
+            fprintf(stderr, "SSH error: %s\n", line);
+            pclose(fp);
+            return;
+        }
 
         // Check if it's a directory (ends with /)
         int is_dir = (len > 0 && line[len - 1] == '/');
@@ -517,57 +594,78 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
         // For non-directories, check if executable via stat
         if (!is_dir && strcmp(line, "..") != 0) {
             char stat_cmd[1024];
-            snprintf(stat_cmd, sizeof(stat_cmd), 
+            int stat_written = snprintf(stat_cmd, sizeof(stat_cmd), 
                     "[ -x '%s/%s' ] && echo 'x' || echo 'n'", path, line);
             
-            FILE *stat_fp = ssh_popen(st->ssh_user, st->ssh_host, stat_cmd);
-            if (stat_fp) {
-                char result[4] = {0};
-                if (fgets(result, sizeof(result), stat_fp)) {
-                    if (result[0] == 'x') {
-                        // Append * for executables
-                        if (len < MAX_LINE_LEN - 1) {
-                            line[len] = '*';
-                            line[len + 1] = '\0';
+            if (stat_written > 0 && stat_written < (int)sizeof(stat_cmd)) {
+                FILE *stat_fp = ssh_popen(st->ssh_user, st->ssh_host, stat_cmd);
+                if (stat_fp) {
+                    char result[4] = {0};
+                    if (fgets(result, sizeof(result), stat_fp)) {
+                        if (result[0] == 'x') {
+                            // Append * for executables
+                            if (len < MAX_LINE_LEN - 1) {
+                                line[len] = '*';
+                                line[len + 1] = '\0';
+                            }
                         }
                     }
+                    pclose(stat_fp);
                 }
-                pclose(stat_fp);
             }
         }
         
         add_line(st, line);
     }
 
-    pclose(fp);
+    int status = pclose(fp);
+    if (status != 0) {
+        fprintf(stderr, "SSH command exited with status %d\n", WEXITSTATUS(status));
+    }
 }
 
 // Load file content from SSH
 static int load_ssh_file(FuzzyState *st, const char *path) {
+    if (!path || !path[0]) {
+        return 0;
+    }
+    
     char user[256], host[256], remote_path[256];
 
-if (!parse_ssh_path(path, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
-    return 0;  // Not an SSH path
-}
+    if (!parse_ssh_path(path, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
+        return 0;  // Not an SSH path
+    }
+
     // Save SSH info for potential later use
     strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
+    st->ssh_host[sizeof(st->ssh_host) - 1] = '\0';
     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
+    st->ssh_user[sizeof(st->ssh_user) - 1] = '\0';
 
     // Execute 'cat' command via SSH
     char command[512];
-    snprintf(command, sizeof(command), "cat '%s'", remote_path);
+    int written = snprintf(command, sizeof(command), "cat '%s'", remote_path);
+    if (written < 0 || written >= (int)sizeof(command)) {
+        fprintf(stderr, "Remote path too long\n");
+        return 0;
+    }
 
     FILE *fp = ssh_popen(user, host, command);
     if (!fp) {
-        fprintf(stderr, "nfzf: failed to execute SSH command for '%s'\n", path);
+        fprintf(stderr, "Failed to execute SSH command for '%s'\n", path);
         return 0;
     }
 
     load_stream(st, fp);
-    pclose(fp);
+    
+    int status = pclose(fp);
+    if (status != 0) {
+        fprintf(stderr, "SSH command failed for '%s'\n", path);
+        return 0;
+    }
+    
     return 1;
 }
-
 static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
     for (int i = first_file_idx; i < argc; i++) {
@@ -682,7 +780,6 @@ static void draw_status_bar(FuzzyState *st) {
 
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 }
-
 static void highlight_matches(const char *line, const char *query, int y, int x_start, int max_x, int case_sensitive) {
     if (!query || !*query) {
         mvprintw(y, x_start, "%.*s", max_x - x_start, line);
@@ -849,10 +946,9 @@ static void toggle_hidden_files(FuzzyState *st) {
 
     st->show_hidden = !st->show_hidden;
 
-    // Clear query to show all files after toggle
-    st->query[0] = '\0';
-    st->query_len = 0;
-
+    // DON'T clear the query - keep the current filter
+    // Just reload the directory with the new hidden files setting
+    
     if (st->ssh_mode) {
         load_ssh_directory(st, st->current_dir);
     } else {
@@ -867,12 +963,14 @@ static void toggle_hidden_files(FuzzyState *st) {
     // Clear screen to make the change obvious
     clear();
 }
-
 static void navigate_directory(FuzzyState *st, const char *selection) {
     if (!st->is_directory_mode) return;
-
+    
+    // Check for null or empty selection
+    if (!selection || !*selection) return;
+    
     char new_path[PATH_MAX];
-
+    
     // Handle parent directory (..)
     if (strcmp(selection, "../") == 0 || strcmp(selection, "..") == 0) {
         // Get parent directory
@@ -890,8 +988,13 @@ static void navigate_directory(FuzzyState *st, const char *selection) {
         // Remove trailing /
         char dirname[MAX_LINE_LEN];
         strncpy(dirname, selection, sizeof(dirname) - 1);
-        dirname[strlen(dirname) - 1] = '\0';
-
+        dirname[sizeof(dirname) - 1] = '\0';  // Ensure null termination
+        
+        size_t len = strlen(dirname);
+        if (len > 0 && dirname[len - 1] == '/') {
+            dirname[len - 1] = '\0';
+        }
+        
         // Build new path - handle root directory to avoid double slash
         if (strcmp(st->current_dir, "/") == 0) {
             snprintf(new_path, sizeof(new_path), "/%s", dirname);
@@ -904,15 +1007,15 @@ static void navigate_directory(FuzzyState *st, const char *selection) {
         // Regular file or executable - don't navigate, just return it
         return;
     }
-
+    
     // Update current directory and reload
     strncpy(st->current_dir, new_path, PATH_MAX - 1);
     st->current_dir[PATH_MAX - 1] = '\0';
-
+    
     // Clear query when navigating
     st->query[0] = '\0';
     st->query_len = 0;
-
+    
     // Reload directory (local or remote)
     if (st->ssh_mode) {
         load_ssh_directory(st, st->current_dir);
@@ -921,7 +1024,6 @@ static void navigate_directory(FuzzyState *st, const char *selection) {
     }
     update_matches(st);
 }
-
 static void handle_resize(FuzzyState *st) {
     resizeterm(0, 0);
     ensure_visible(st);
@@ -959,16 +1061,16 @@ static int handle_input(FuzzyState *st, int *running) {
             case '\n':
             case '\r':
             case KEY_ENTER:
-                if (st->is_directory_mode && st->match_count > 0) {
-                    // Get selected line
+                if (st->is_directory_mode && st->match_count > 0 && st->selected < st->match_count) {
                     int line_idx = st->match_indices[st->selected];
                     const char *selection = st->lines[line_idx];
-
-                    // Check if it's a directory
-                    if (selection[strlen(selection) - 1] == '/' ||
-                        strcmp(selection, "..") == 0) {
+                    
+                    // Add safety check
+                    if (selection && strlen(selection) > 0 &&
+                        (selection[strlen(selection) - 1] == '/' ||
+                         strcmp(selection, "..") == 0)) {
                         navigate_directory(st, selection);
-                        break;  // Don't exit, stay in the browser
+                        break;
                     }
                 }
                 *running = 0;
@@ -1027,14 +1129,14 @@ static int handle_input(FuzzyState *st, int *running) {
             case '\n':
             case '\r':
             case KEY_ENTER:
-                if (st->is_directory_mode && st->match_count > 0) {
-                    // Get selected line
+                if (st->is_directory_mode && st->match_count > 0 && st->selected < st->match_count) {
                     int line_idx = st->match_indices[st->selected];
                     const char *selection = st->lines[line_idx];
 
                     // Check if it's a directory
-                    if (selection[strlen(selection) - 1] == '/' ||
-                        strcmp(selection, "..") == 0) {
+                    if (selection && strlen(selection) > 0 &&
+                        (selection[strlen(selection) - 1] == '/' ||
+                         strcmp(selection, "..") == 0)) {
                         navigate_directory(st, selection);
                         break;  // Don't exit, stay in the browser
                     }
@@ -1069,9 +1171,6 @@ static int handle_input(FuzzyState *st, int *running) {
 
     return -2;
 }
-
-// Parse options and return index of first non-option argument (files).
-// Supports `--` to end option parsing.
 static int parse_flags(int argc, char **argv, FuzzyState *st) {
     int i = 1;
     for (; i < argc; i++) {
@@ -1102,9 +1201,12 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
                 if (parse_ssh_path(dir_arg, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
                     // SSH directory mode
                     st->ssh_mode = 1;
-                    strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
-                    strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
-                    strncpy(st->current_dir, remote_path, PATH_MAX - 1);
+strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
+st->ssh_user[sizeof(st->ssh_user) - 1] = '\0';
+strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
+st->ssh_host[sizeof(st->ssh_host) - 1] = '\0';
+strncpy(st->current_dir, remote_path, PATH_MAX - 1);
+st->current_dir[PATH_MAX - 1] = '\0';
                 } else {
                     // Local directory mode
                     strncpy(st->current_dir, dir_arg, PATH_MAX - 1);
@@ -1112,7 +1214,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
             } else {
                 // No directory specified, use current
                 if (!getcwd(st->current_dir, PATH_MAX)) {
-                    fprintf(stderr, "Error: failed to get current directory\n");
+        fprintf(stderr, "Error: failed to get current directory: %s\n", strerror(errno));
                     return -1;
                 }
             }
@@ -1128,7 +1230,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
 }
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
-
+char output[256];
     FuzzyState *st = calloc(1, sizeof(FuzzyState));
     if (!st) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -1264,7 +1366,6 @@ int main(int argc, char **argv) {
         const char *selected = st->lines[line_idx];
 
         // Strip trailing / or * markers for output
-        char output[MAX_LINE_LEN];
         strncpy(output, selected, sizeof(output) - 1);
         output[sizeof(output) - 1] = '\0';
 
