@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <locale.h>
 #include <unistd.h>
@@ -105,13 +106,24 @@ static void usage(const char *prog) {
     );
 }
 
-static char* strip_ansi(const char *str) {
-    static char clean[MAX_LINE_LEN];
-    int i = 0, j = 0;
 
-    while (str[i] && j < MAX_LINE_LEN - 1) {
+int strip_ansi(const char *str, char *clean, size_t clean_size) {
+    if (!str || !clean || clean_size == 0) {
+        return -1;
+    }
+    
+    size_t i = 0, j = 0;
+    int truncated = 0;
+    
+    while (str[i]) {
         if (str[i] == '\033') {
-            // Handle various ANSI escape sequences
+            // Bounds check: ensure we can look ahead
+            if (!str[i+1]) {
+                // ESC at end of string, just skip it
+                i++;
+                continue;
+            }
+            
             if (str[i+1] == '[') {
                 // CSI (Control Sequence Introducer) - most common
                 // Format: ESC [ <parameters> <letter>
@@ -120,6 +132,7 @@ static char* strip_ansi(const char *str) {
                     i++;
                 }
                 if (str[i]) i++;  // Skip the final letter
+                
             } else if (str[i+1] == ']') {
                 // OSC (Operating System Command)
                 // Format: ESC ] params BEL or ESC ] params ESC backslash
@@ -132,24 +145,76 @@ static char* strip_ansi(const char *str) {
                 } else if (str[i] == '\033' && str[i+1] == '\\') {
                     i += 2;  // Skip ESC backslash
                 }
-            } else if (str[i+1] == '(' || str[i+1] == ')') {
-                // Character set selection
+                
+            } else if (str[i+1] == '(' || str[i+1] == ')' || 
+                       str[i+1] == '*' || str[i+1] == '+') {
+                // Character set selection (G0-G3)
+                // Format: ESC ( <char> or ESC ) <char> etc.
                 i += 2;
                 if (str[i]) i++;
-            } else if (str[i+1] >= '@' && str[i+1] <= '_') {
-                // Two-byte sequence
+                
+            } else if (str[i+1] == '#') {
+                // Line attributes (double height/width)
+                // Format: ESC # <digit>
                 i += 2;
+                if (str[i]) i++;
+                
+            } else if (str[i+1] == '%') {
+                // Character set selection
+                // Format: ESC % <char>
+                i += 2;
+                if (str[i]) i++;
+                
+            } else if (str[i+1] == 'c') {
+                // Reset (RIS)
+                i += 2;
+                
+            } else if (str[i+1] == '=' || str[i+1] == '>') {
+                // Keypad modes
+                i += 2;
+                
+            } else if (str[i+1] >= '@' && str[i+1] <= '_') {
+                // Two-byte escape sequence (Fe sequences)
+                i += 2;
+                
+            } else if (str[i+1] >= '0' && str[i+1] <= '9') {
+                // Some terminals use ESC <digit> sequences
+                i += 2;
+                
             } else {
                 // Unknown escape, skip ESC and continue
                 i++;
             }
+            
         } else {
-            clean[j++] = str[i++];
+            // Regular character - copy to output
+            if (j < clean_size - 1) {
+                clean[j++] = str[i++];
+            } else {
+                // Output buffer full
+                truncated = 1;
+                i++;
+            }
         }
     }
+    
     clean[j] = '\0';
-    return clean;
+    return truncated ? -1 : (int)j;
 }
+
+
+// Thread-safe version using thread-local storage (C11)
+#if __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+
+static thread_local char tls_buffer[MAX_LINE_LEN];
+
+char* strip_ansi_tls(const char *str) {
+    strip_ansi(str, tls_buffer, MAX_LINE_LEN);
+    return tls_buffer;
+}
+#endif
+
 
 static int fuzzy_score(const char *needle, const char *haystack, int case_sensitive) {
     if (!needle || !*needle) return 1000;
@@ -256,9 +321,9 @@ static void update_matches(FuzzyState *st) {
 static void add_line(FuzzyState *st, const char *s) {
     if (st->line_count >= MAX_LINES) return;
     if (!s || !*s) return;
-
-    const char *clean = strip_ansi(s);
-    st->lines[st->line_count++] = strdup(clean);
+char clean[MAX_LINE_LEN];
+strip_ansi(s, clean, sizeof(clean));
+st->lines[st->line_count++] = strdup(clean);
 }
 
 static void load_stream(FuzzyState *st, FILE *fp) {
