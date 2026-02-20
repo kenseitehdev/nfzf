@@ -706,7 +706,32 @@ static void load_directory(FuzzyState *st, const char *path) {
 
 #include <string.h>
 #include <stddef.h>
+static char *sh_sq(const char *in) {
+    if (!in) return NULL;
 
+    size_t len = strlen(in);
+    size_t extra = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (in[i] == '\'') extra += 3; // '\'' adds 3 extra chars beyond the original '
+    }
+
+    char *out = malloc(len + extra + 3); // outer quotes + NUL
+    if (!out) return NULL;
+
+    char *p = out;
+    *p++ = '\'';
+    for (size_t i = 0; i < len; i++) {
+        if (in[i] == '\'') {
+            memcpy(p, "'\\''", 4);
+            p += 4;
+        } else {
+            *p++ = in[i];
+        }
+    }
+    *p++ = '\'';
+    *p = '\0';
+    return out;
+}
 static int parse_ssh_path(const char *path, char *user, size_t user_size,
                           char *host, size_t host_size,
                           char *remote_path, size_t remote_path_size) {
@@ -754,23 +779,31 @@ static int parse_ssh_path(const char *path, char *user, size_t user_size,
 
     return 1;
 }
-
-// Execute command via SSH and capture output
 static FILE *ssh_popen(const char *user, const char *host, const char *command) {
     if (!host || !host[0] || !command || !command[0]) {
         return NULL;
     }
 
-    char ssh_cmd[2048];
+    // Quote the remote command as a single local-shell-safe argument.
+    // ssh will pass it to the remote user's shell; within that, our command
+    // string itself still needs to be constructed safely by the caller.
+    char *qcmd = sh_sq(command);
+    if (!qcmd) return NULL;
+
+    char ssh_cmd[4096];
     int written;
 
     if (user && user[0]) {
-        written = snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh -o ConnectTimeout=10 -o BatchMode=yes %s@%s '%s' 2>&1",
-                          user, host, command);
+        written = snprintf(ssh_cmd, sizeof(ssh_cmd),
+            "ssh -o ConnectTimeout=10 -o BatchMode=yes %s@%s %s 2>&1",
+            user, host, qcmd);
     } else {
-        written = snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh -o ConnectTimeout=10 -o BatchMode=yes %s '%s' 2>&1",
-                          host, command);
+        written = snprintf(ssh_cmd, sizeof(ssh_cmd),
+            "ssh -o ConnectTimeout=10 -o BatchMode=yes %s %s 2>&1",
+            host, qcmd);
     }
+
+    free(qcmd);
 
     if (written < 0 || written >= (int)sizeof(ssh_cmd)) {
         fprintf(stderr, "SSH command too long\n");
@@ -779,8 +812,6 @@ static FILE *ssh_popen(const char *user, const char *host, const char *command) 
 
     return popen(ssh_cmd, "r");
 }
-
-// Load remote directory listing via SSH
 static void load_ssh_directory(FuzzyState *st, const char *path) {
     if (!path || !path[0]) {
         fprintf(stderr, "Invalid remote path\n");
@@ -794,18 +825,29 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
     }
     st->line_count = 0;
 
+    // Quote remote path safely for the *remote* shell command we build.
+    // We are constructing a remote shell snippet, so we must quote path inside it.
+    char *qpath = sh_sq(path);
+    if (!qpath) {
+        fprintf(stderr, "Out of memory\n");
+        return;
+    }
+
     // Build ls command with options
-    char ls_cmd[1024];
+    char ls_cmd[2048];
     int written;
+
     if (st->show_hidden) {
         written = snprintf(ls_cmd, sizeof(ls_cmd),
-                "cd '%s' 2>/dev/null && ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null",
-                path);
+            "cd -- %s 2>/dev/null && ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null",
+            qpath);
     } else {
         written = snprintf(ls_cmd, sizeof(ls_cmd),
-                "cd '%s' 2>/dev/null && ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null",
-                path);
+            "cd -- %s 2>/dev/null && ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null",
+            qpath);
     }
+
+    free(qpath);
 
     if (written < 0 || written >= (int)sizeof(ls_cmd)) {
         fprintf(stderr, "Directory path too long\n");
@@ -839,29 +881,46 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
             return;
         }
 
-        // Check if it's a directory (ends with /)
+        // Directory?
         int is_dir = (len > 0 && line[len - 1] == '/');
 
-        // For non-directories, check if executable via stat
+        // For non-directories, check if executable
+        // IMPORTANT: line may later get a '*' appended; do the check before modifying it.
         if (!is_dir && strcmp(line, "..") != 0) {
-            char stat_cmd[1024];
-            int stat_written = snprintf(stat_cmd, sizeof(stat_cmd),
-                    "[ -x '%s/%s' ] && echo 'x' || echo 'n'", path, line);
+            // Build full remote path = path + "/" + line (with any trailing '*' removed just in case)
+            char name[MAX_LINE_LEN];
+            strncpy(name, line, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
 
-            if (stat_written > 0 && stat_written < (int)sizeof(stat_cmd)) {
-                FILE *stat_fp = ssh_popen(st->ssh_user, st->ssh_host, stat_cmd);
-                if (stat_fp) {
-                    char result[4] = {0};
-                    if (fgets(result, sizeof(result), stat_fp)) {
-                        if (result[0] == 'x') {
-                            // Append * for executables
-                            if (len < MAX_LINE_LEN - 1) {
-                                line[len] = '*';
-                                line[len + 1] = '\0';
+            size_t nlen = strlen(name);
+            if (nlen > 0 && name[nlen - 1] == '*') name[nlen - 1] = '\0';
+
+            char full[MAX_LINE_LEN * 2];
+            snprintf(full, sizeof(full), "%s/%s", path, name);
+
+            char *qfull = sh_sq(full);
+            if (qfull) {
+                char stat_cmd[2048];
+                int stat_written = snprintf(stat_cmd, sizeof(stat_cmd),
+                    "[ -x %s ] && echo x || echo n", qfull);
+                free(qfull);
+
+                if (stat_written > 0 && stat_written < (int)sizeof(stat_cmd)) {
+                    FILE *stat_fp = ssh_popen(st->ssh_user, st->ssh_host, stat_cmd);
+                    if (stat_fp) {
+                        char result[8] = {0};
+                        if (fgets(result, sizeof(result), stat_fp)) {
+                            if (result[0] == 'x') {
+                                // Append * for executables
+                                len = strlen(line);
+                                if (len < MAX_LINE_LEN - 2) {
+                                    line[len] = '*';
+                                    line[len + 1] = '\0';
+                                }
                             }
                         }
+                        pclose(stat_fp);
                     }
-                    pclose(stat_fp);
                 }
             }
         }
@@ -874,7 +933,6 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
         fprintf(stderr, "SSH command exited with status %d\n", WEXITSTATUS(status));
     }
 }
-
 // Load file content from SSH
 static int load_ssh_file(FuzzyState *st, const char *path) {
     if (!path || !path[0]) {
