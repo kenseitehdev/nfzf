@@ -1,6 +1,6 @@
 // ff - NBL Fuzzy Filter (Enhanced with regex, grep, and mode toggles)
 #define _POSIX_C_SOURCE 200809L
-#define _DARWIN_C_SOURCE  
+#define _DARWIN_C_SOURCE
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +17,10 @@
 #include <dirent.h>
 #include <limits.h>
 #include <regex.h>
-
-#define MAX_LINES 100000
+#include <time.h>
+#include <sys/time.h>   // needed for gettimeofday() fallback#define MAX_LINES 100000
 #define MAX_LINE_LEN 2048
-
+#define MAX_LINES 2000
 #define COLOR_NORMAL     1
 #define COLOR_SELECTED   2
 #define COLOR_MATCH      3
@@ -65,19 +65,38 @@ typedef struct {
     regex_t regex;         // NEW: compiled regex
     int regex_valid;       // NEW: track if regex is valid
     char regex_error[256]; // NEW: store regex error messages
-    
+
     // NEW: for grep mode - store source information
     char **source_files;   // Array of source file names
     int *line_numbers;     // Line numbers for each line
     int source_file_count;
     int grep_mode;         // Flag for grep mode
-    
+
     // NEW: for refresh capability - store original input files
     char **input_files;    // Copy of file paths for refresh
     int input_file_count;  // Number of input files
     int from_stdin;        // Flag if input was from stdin
+        // NEW: live mode (watch-like)
+    int   live_mode;
+    char *live_cmd;
+    int   live_interval_ms;
+    long  last_live_refresh_ms;
 } FuzzyState;
-
+static void load_stream(FuzzyState *st, FILE *fp);
+static void update_matches(FuzzyState *st);
+static void ensure_visible(FuzzyState *st);
+static long now_ms(void) {
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
+#else
+    // fallback (less ideal, but ok)
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)(tv.tv_sec * 1000L + tv.tv_usec / 1000L);
+#endif
+}
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -87,6 +106,8 @@ static void usage(const char *prog) {
         "  %s [OPTIONS] -D [directory]\n"
         "  %s [OPTIONS] -D [user@]host:directory\n"
         "  %s [OPTIONS] -G file1 [file2 ...]\n"
+        "  --live CMD          Live mode: rerun CMD periodically and refresh results\n"
+        "  --interval MS       Live refresh interval in milliseconds (default 1000)\n"
         "\n"
         "Options:\n"
         "  -h, --help          Show this help\n"
@@ -146,7 +167,86 @@ static void usage(const char *prog) {
         prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
+static void refresh_live_command(FuzzyState *st) {
+    if (!st->live_mode || !st->live_cmd || !st->live_cmd[0]) return;
 
+    // Remember current selected line (if any) so we can try to reselect it
+    char want[MAX_LINE_LEN];
+    want[0] = '\0';
+    if (st->match_count > 0 && st->selected >= 0 && st->selected < st->match_count) {
+        int old_idx = st->match_indices[st->selected];
+        const char *s = st->lines[old_idx];
+        if (s) {
+            strncpy(want, s, sizeof(want) - 1);
+            want[sizeof(want) - 1] = '\0';
+        }
+    }
+
+    // Backup old pointers
+    int old_line_count = st->line_count;
+    char **old_lines = NULL;
+
+    if (old_line_count > 0) {
+        old_lines = calloc(old_line_count, sizeof(char*));
+        if (old_lines) {
+            for (int i = 0; i < old_line_count; i++) old_lines[i] = st->lines[i];
+        }
+    }
+
+    st->line_count = 0;
+
+    FILE *fp = popen(st->live_cmd, "r");
+    if (!fp) {
+        // restore
+        if (old_lines) {
+            for (int i = 0; i < old_line_count; i++) st->lines[i] = old_lines[i];
+            st->line_count = old_line_count;
+            free(old_lines);
+        }
+        return;
+    }
+
+    load_stream(st, fp);
+    pclose(fp);
+
+    int success = (st->line_count > 0);
+
+    if (!success) {
+        // free newly loaded (if any), restore old
+        for (int i = 0; i < st->line_count; i++) free(st->lines[i]);
+        if (old_lines) {
+            for (int i = 0; i < old_line_count; i++) st->lines[i] = old_lines[i];
+            st->line_count = old_line_count;
+            free(old_lines);
+        }
+        return;
+    }
+
+    // refresh succeeded: free old
+    if (old_lines) {
+        for (int i = 0; i < old_line_count; i++) free(old_lines[i]);
+        free(old_lines);
+    }
+
+    update_matches(st);
+
+    // Try to reselect previous selection string
+    if (want[0] != '\0' && st->match_count > 0) {
+        for (int m = 0; m < st->match_count; m++) {
+            int idx = st->match_indices[m];
+            if (st->lines[idx] && strcmp(st->lines[idx], want) == 0) {
+                st->selected = m;
+                ensure_visible(st);
+                return;
+            }
+        }
+    }
+
+    // fallback
+    st->selected = 0;
+    st->scroll_offset = 0;
+    clear();
+}
 
 int strip_ansi(const char *str, char *clean, size_t clean_size) {
     if (!str || !clean || clean_size == 0) {
@@ -318,20 +418,20 @@ static int fuzzy_score(const char *needle, const char *haystack, int case_sensit
 }
 
 // NEW: Regex matching function
-static int regex_score(const char *pattern, const char *haystack, int case_sensitive, 
+static int regex_score(const char *pattern, const char *haystack, int case_sensitive,
                        regex_t *regex, int *regex_valid, char *regex_error, size_t error_size) {
     if (!pattern || !*pattern) {
         *regex_valid = 0;
         return 1000;  // Empty pattern matches everything
     }
-    
+
     // Compile regex if needed
     if (!*regex_valid) {
         int flags = REG_EXTENDED | REG_NOSUB;
         if (!case_sensitive) {
             flags |= REG_ICASE;
         }
-        
+
         int ret = regcomp(regex, pattern, flags);
         if (ret != 0) {
             regerror(ret, regex, regex_error, error_size);
@@ -340,17 +440,17 @@ static int regex_score(const char *pattern, const char *haystack, int case_sensi
         }
         *regex_valid = 1;  // Valid regex
     }
-    
+
     if (*regex_valid < 0) {
         return -1;  // Previously failed to compile
     }
-    
+
     // Execute regex
     int ret = regexec(regex, haystack, 0, NULL, 0);
     if (ret == 0) {
         return 1000;  // Match found
     }
-    
+
     return -1;  // No match
 }
 
@@ -398,28 +498,28 @@ static void update_matches(FuzzyState *st) {
 
     for (int i = 0; i < st->line_count; i++) {
         int score = -1;
-        
+
         switch (st->match_mode) {
             case MATCH_EXACT: {
-                const char *found = st->case_sensitive ? 
+                const char *found = st->case_sensitive ?
                     strstr(st->lines[i], st->query) :
                     strcasestr(st->lines[i], st->query);
                 score = found ? 1000 : -1;
                 break;
             }
-            
+
             case MATCH_REGEX:
                 score = regex_score(st->query, st->lines[i], st->case_sensitive,
-                                  &st->regex, &st->regex_valid, 
+                                  &st->regex, &st->regex_valid,
                                   st->regex_error, sizeof(st->regex_error));
                 break;
-            
+
             case MATCH_FUZZY:
             default:
                 score = fuzzy_score(st->query, st->lines[i], st->case_sensitive);
                 break;
         }
-        
+
         st->scores[i] = score;
         if (score >= 0) st->match_indices[st->match_count++] = i;
     }
@@ -466,13 +566,13 @@ static void add_line(FuzzyState *st, const char *s) {
 static void add_line_grep(FuzzyState *st, const char *filename, int line_num, const char *content) {
     if (st->line_count >= MAX_LINES) return;
     if (!content || !*content) return;
-    
+
     // Format: filename:line_number:content
     char formatted[MAX_LINE_LEN];
     snprintf(formatted, sizeof(formatted), "%s:%d:%s", filename, line_num, content);
-    
+
     add_line(st, formatted);
-    
+
     // Store metadata
     if (st->line_numbers) {
         st->line_numbers[st->line_count - 1] = line_num;
@@ -509,31 +609,31 @@ static void load_file_grep(FuzzyState *st, const char *filename) {
         fprintf(stderr, "Warning: failed to open '%s': %s\n", filename, strerror(errno));
         return;
     }
-    
+
     char line[MAX_LINE_LEN];
     int line_num = 1;
-    
+
     while (fgets(line, sizeof(line), fp) && st->line_count < MAX_LINES) {
         size_t len = strlen(line);
-        
+
         // Handle truncation
         if (len > 0 && len == MAX_LINE_LEN - 1 && line[len - 1] != '\n') {
             int ch;
             while ((ch = fgetc(fp)) != EOF && ch != '\n') {}
         }
-        
+
         // Remove trailing newlines
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
         }
-        
+
         if (len > 0) {
             add_line_grep(st, filename, line_num, line);
         }
-        
+
         line_num++;
     }
-    
+
     fclose(fp);
 }
 
@@ -849,25 +949,25 @@ static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx)
 // NEW: Load files in grep mode
 static int load_files_grep(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
-    
+
     for (int i = first_file_idx; i < argc; i++) {
         const char *path = argv[i];
-        
+
         // Skip SSH paths for now in grep mode
         if (strchr(path, ':')) {
             fprintf(stderr, "Warning: SSH paths not supported in grep mode: %s\n", path);
             continue;
         }
-        
+
         load_file_grep(st, path);
         loaded_any = 1;
-        
+
         if (st->line_count >= MAX_LINES) {
             fprintf(stderr, "Warning: MAX_LINES (%d) reached, some files not loaded\n", MAX_LINES);
             break;
         }
     }
-    
+
     return loaded_any;
 }
 
@@ -883,7 +983,7 @@ static void free_state(FuzzyState *st) {
     free(st->match_indices);
     free(st->source_files);
     free(st->line_numbers);
-    
+
     // Free input files for refresh
     if (st->input_files) {
         for (int i = 0; i < st->input_file_count; i++) {
@@ -891,10 +991,11 @@ static void free_state(FuzzyState *st) {
         }
         free(st->input_files);
     }
-    
+
     if (st->regex_valid > 0) {
         regfree(&st->regex);
     }
+    free(st->live_cmd);
 }
 
 static void draw_status_bar(FuzzyState *st) {
@@ -1125,13 +1226,13 @@ static void add_char(FuzzyState *st, char c) {
     if (st->query_len < (int)sizeof(st->query) - 1) {
         st->query[st->query_len++] = c;
         st->query[st->query_len] = '\0';
-        
+
         // NEW: Invalidate regex on query change
         if (st->match_mode == MATCH_REGEX && st->regex_valid > 0) {
             regfree(&st->regex);
             st->regex_valid = 0;
         }
-        
+
         update_matches(st);
     }
 }
@@ -1139,13 +1240,13 @@ static void add_char(FuzzyState *st, char c) {
 static void delete_char(FuzzyState *st) {
     if (st->query_len > 0) {
         st->query[--st->query_len] = '\0';
-        
+
         // NEW: Invalidate regex on query change
         if (st->match_mode == MATCH_REGEX && st->regex_valid > 0) {
             regfree(&st->regex);
             st->regex_valid = 0;
         }
-        
+
         update_matches(st);
     }
 }
@@ -1156,26 +1257,26 @@ static void delete_word(FuzzyState *st) {
         st->query[--st->query_len] = '\0';
         if (c == ' ' || c == '/' || c == '_' || c == '-') break;
     }
-    
+
     // NEW: Invalidate regex on query change
     if (st->match_mode == MATCH_REGEX && st->regex_valid > 0) {
         regfree(&st->regex);
         st->regex_valid = 0;
     }
-    
+
     update_matches(st);
 }
 
 static void clear_query(FuzzyState *st) {
     st->query[0] = '\0';
     st->query_len = 0;
-    
+
     // NEW: Invalidate regex
     if (st->match_mode == MATCH_REGEX && st->regex_valid > 0) {
         regfree(&st->regex);
         st->regex_valid = 0;
     }
-    
+
     update_matches(st);
 }
 
@@ -1186,13 +1287,13 @@ static void toggle_exact_mode(FuzzyState *st) {
     } else {
         st->match_mode = MATCH_EXACT;
     }
-    
+
     // Clean up regex if switching away from it
     if (st->regex_valid > 0) {
         regfree(&st->regex);
         st->regex_valid = 0;
     }
-    
+
     update_matches(st);
 }
 
@@ -1202,13 +1303,13 @@ static void toggle_fuzzy_mode(FuzzyState *st) {
     } else {
         st->match_mode = MATCH_FUZZY;
     }
-    
+
     // Clean up regex if switching away from it
     if (st->regex_valid > 0) {
         regfree(&st->regex);
         st->regex_valid = 0;
     }
-    
+
     update_matches(st);
 }
 
@@ -1228,7 +1329,7 @@ static void toggle_regex_mode(FuzzyState *st) {
         st->match_mode = MATCH_REGEX;
         st->regex_valid = 0;  // Will recompile on next match
     }
-    
+
     update_matches(st);
 }
 
@@ -1239,7 +1340,7 @@ static void store_input_files(FuzzyState *st, int argc, char **argv, int first_f
         st->input_files = NULL;
         return;
     }
-    
+
     int count = argc - first_file_idx;
     st->input_files = calloc(count, sizeof(char*));
     if (!st->input_files) {
@@ -1247,7 +1348,7 @@ static void store_input_files(FuzzyState *st, int argc, char **argv, int first_f
         st->input_file_count = 0;
         return;
     }
-    
+
     st->input_file_count = 0;
     for (int i = first_file_idx; i < argc; i++) {
         st->input_files[st->input_file_count] = strdup(argv[i]);
@@ -1259,6 +1360,10 @@ static void store_input_files(FuzzyState *st, int argc, char **argv, int first_f
 
 static void refresh_source(FuzzyState *st) {
     // DEBUG: Write to a log file to see what's happening
+        if (st->live_mode) {
+        refresh_live_command(st);
+        return;
+    }
     FILE *debug = fopen("/tmp/ff_debug.log", "a");
     if (debug) {
         fprintf(debug, "=== REFRESH CALLED ===\n");
@@ -1276,11 +1381,11 @@ static void refresh_source(FuzzyState *st) {
         }
         fclose(debug);
     }
-    
+
     // Save current line count to restore if refresh fails
     int old_line_count = st->line_count;
     char **old_lines = NULL;
-    
+
     // Backup current lines in case refresh fails
     if (st->line_count > 0) {
         old_lines = calloc(st->line_count, sizeof(char*));
@@ -1290,13 +1395,13 @@ static void refresh_source(FuzzyState *st) {
             }
         }
     }
-    
+
     // Clear line pointers (but don't free yet - we have backup)
     st->line_count = 0;
-    
+
     // Reload based on mode
     int success = 0;
-    
+
     if (st->is_directory_mode) {
         if (st->ssh_mode) {
             load_ssh_directory(st, st->current_dir);
@@ -1304,7 +1409,7 @@ static void refresh_source(FuzzyState *st) {
             load_directory(st, st->current_dir);
         }
         success = (st->line_count > 0);
-        
+
     } else if (st->from_stdin) {
         // Can't refresh stdin - restore old data and continue
         if (old_lines) {
@@ -1314,16 +1419,16 @@ static void refresh_source(FuzzyState *st) {
             st->line_count = old_line_count;
             free(old_lines);
         }
-        
+
         // Show error message in status bar (will be visible on next draw)
         // Just return without refreshing
         return;
-        
+
     } else if (st->input_file_count > 0 && st->input_files) {
         // Reload from stored file list
         for (int i = 0; i < st->input_file_count && st->line_count < MAX_LINES; i++) {
             const char *path = st->input_files[i];
-            
+
             // Try SSH path first
             if (strchr(path, ':')) {
                 if (load_ssh_file(st, path)) {
@@ -1331,7 +1436,7 @@ static void refresh_source(FuzzyState *st) {
                     continue;
                 }
             }
-            
+
             // Fall back to local file
             if (st->grep_mode) {
                 load_file_grep(st, path);
@@ -1355,7 +1460,7 @@ static void refresh_source(FuzzyState *st) {
         }
         return;
     }
-    
+
     // If refresh succeeded, free old backup
     if (success && old_lines) {
         for (int i = 0; i < old_line_count; i++) {
@@ -1375,11 +1480,11 @@ static void refresh_source(FuzzyState *st) {
         free(old_lines);
         return;
     }
-    
+
     update_matches(st);
     st->selected = 0;
     st->scroll_offset = 0;
-    
+
     clear();
 }
 
@@ -1632,50 +1737,70 @@ static int handle_input(FuzzyState *st, int *running) {
 
 static int parse_flags(int argc, char **argv, FuzzyState *st) {
     int i = 1;
+
     for (; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { i++; break; }
 
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return -1;
+
         } else if (strcmp(argv[i], "-i") == 0) {
             st->case_sensitive = 0;
+
         } else if (strcmp(argv[i], "-s") == 0) {
             st->case_sensitive = 1;
+
         } else if (strcmp(argv[i], "-e") == 0) {
             st->match_mode = MATCH_EXACT;
+
         } else if (strcmp(argv[i], "-r") == 0) {
             st->match_mode = MATCH_REGEX;
+
         } else if (strcmp(argv[i], "-d") == 0) {
             if (i + 1 < argc) st->delimiter = argv[++i][0];
             else {
                 fprintf(stderr, "Error: -d requires an argument\n");
                 return -1;
             }
+
         } else if (strcmp(argv[i], "-G") == 0) {
-            // NEW: Grep mode
             st->grep_mode = 1;
-            st->line_numbers = calloc(MAX_LINES, sizeof(int));
+
+            // (metadata storage)
             if (!st->line_numbers) {
-                fprintf(stderr, "Failed to allocate line numbers array\n");
-                return -1;
+                st->line_numbers = calloc(MAX_LINES, sizeof(int));
+                if (!st->line_numbers) {
+                    fprintf(stderr, "Failed to allocate line numbers array\n");
+                    return -1;
+                }
             }
+
         } else if (strcmp(argv[i], "-D") == 0) {
             st->is_directory_mode = 1;
+
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 const char *dir_arg = argv[++i];
 
                 char user[256], host[256], remote_path[256];
-                if (parse_ssh_path(dir_arg, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
+                if (parse_ssh_path(dir_arg,
+                                   user, sizeof(user),
+                                   host, sizeof(host),
+                                   remote_path, sizeof(remote_path))) {
                     st->ssh_mode = 1;
+
                     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
                     st->ssh_user[sizeof(st->ssh_user) - 1] = '\0';
+
                     strncpy(st->ssh_host, host, sizeof(st->ssh_host) - 1);
                     st->ssh_host[sizeof(st->ssh_host) - 1] = '\0';
+
                     strncpy(st->current_dir, remote_path, PATH_MAX - 1);
                     st->current_dir[PATH_MAX - 1] = '\0';
                 } else {
+                    // local dir
                     strncpy(st->current_dir, dir_arg, PATH_MAX - 1);
+                    st->current_dir[PATH_MAX - 1] = '\0';
                 }
             } else {
                 if (!getcwd(st->current_dir, PATH_MAX)) {
@@ -1683,21 +1808,48 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
                     return -1;
                 }
             }
+
+        } else if (strcmp(argv[i], "--live") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --live requires a command string\n");
+                return -1;
+            }
+
+            free(st->live_cmd);
+            st->live_cmd = strdup(argv[++i]);
+            if (!st->live_cmd) {
+                fprintf(stderr, "Error: out of memory\n");
+                return -1;
+            }
+            st->live_mode = 1;
+
+        } else if (strcmp(argv[i], "--interval") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --interval requires milliseconds\n");
+                return -1;
+            }
+
+            int ms = atoi(argv[++i]);
+            if (ms < 50) ms = 50;
+            st->live_interval_ms = ms;
+
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return -1;
+
         } else {
+            // first non-flag argument
             break;
         }
     }
-    return i;
-}
 
+    return i; // index of first non-flag arg
+}
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
     char output[256];
-    
+
     FuzzyState *st = calloc(1, sizeof(FuzzyState));
     if (!st) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -1725,7 +1877,10 @@ int main(int argc, char **argv) {
     st->input_files = NULL;
     st->input_file_count = 0;
     st->from_stdin = 0;
-
+        st->live_mode = 0;
+    st->live_cmd = NULL;
+    st->live_interval_ms = 1000;
+    st->last_live_refresh_ms = 0;
     int first_file_idx = parse_flags(argc, argv, st);
     if (first_file_idx < 0) {
         free(st);
@@ -1744,42 +1899,49 @@ int main(int argc, char **argv) {
     }
 
     // Input mode
-    if (st->is_directory_mode) {
-        if (st->ssh_mode) {
-            load_ssh_directory(st, st->current_dir);
-        } else {
-            load_directory(st, st->current_dir);
-        }
-    } else if (!isatty(STDIN_FILENO)) {
-        st->from_stdin = 1;
-        load_stdin(st);
-    } else {
-        if (first_file_idx >= argc) {
-            fprintf(stderr, "nfzf: no piped input and no files provided.\n\n");
-            usage(argv[0]);
-            free_state(st);
-            free(st);
-            return 1;
-        }
-        
-        // Store input files for refresh capability
-        store_input_files(st, argc, argv, first_file_idx);
-        
-        int ok;
-        if (st->grep_mode) {
-            ok = load_files_grep(st, argc, argv, first_file_idx);
-        } else {
-            ok = load_files(st, argc, argv, first_file_idx);
-        }
-        
-        if (!ok) {
-            fprintf(stderr, "nfzf: no readable input files.\n");
-            free_state(st);
-            free(st);
-            return 1;
-        }
+// Input mode
+if (st->is_directory_mode) {
+
+    if (st->ssh_mode)
+        load_ssh_directory(st, st->current_dir);
+    else
+        load_directory(st, st->current_dir);
+
+} else if (st->live_mode) {
+
+    // Live mode provides its own input source
+    refresh_live_command(st);
+
+} else if (!isatty(STDIN_FILENO)) {
+
+    st->from_stdin = 1;
+    load_stdin(st);
+
+} else {
+
+    if (first_file_idx >= argc) {
+        fprintf(stderr, "nfzf: no piped input, no files, and no --live command provided.\n\n");
+        usage(argv[0]);
+        free_state(st);
+        free(st);
+        return 1;
     }
 
+    store_input_files(st, argc, argv, first_file_idx);
+
+    int ok;
+    if (st->grep_mode)
+        ok = load_files_grep(st, argc, argv, first_file_idx);
+    else
+        ok = load_files(st, argc, argv, first_file_idx);
+
+    if (!ok) {
+        fprintf(stderr, "nfzf: no readable input files.\n");
+        free_state(st);
+        free(st);
+        return 1;
+    }
+}
     if (st->line_count == 0) {
         fprintf(stderr, "No input lines\n");
         free_state(st);
@@ -1819,8 +1981,8 @@ int main(int argc, char **argv) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-    timeout(-1);
-
+if (st->live_mode) timeout(50);  // poll for keys
+else timeout(-1);               // block
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -1838,9 +2000,21 @@ int main(int argc, char **argv) {
 
     while (running) {
         draw_ui(st);
-        result = handle_input(st, &running);
-    }
 
+        int r = handle_input(st, &running);
+        if (!running) { result = r; break; }
+        // (ignore r == -2 / ERR etc)
+
+        if (st->live_mode) {
+            long t = now_ms();
+            if (st->last_live_refresh_ms == 0) st->last_live_refresh_ms = t;
+
+            if (t - st->last_live_refresh_ms >= st->live_interval_ms) {
+                refresh_live_command(st);
+                st->last_live_refresh_ms = t;
+            }
+        }
+    }
     endwin();
     delscreen(scr);
     fclose(tty_in);
