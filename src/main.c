@@ -104,7 +104,104 @@ typedef struct {
 static void load_stream(FuzzyState *st, FILE *fp);
 static void update_matches(FuzzyState *st);
 static void ensure_visible(FuzzyState *st);
+static char *quote_dash_safe(const char *path);
+static FILE *ssh_popen(const char *user, const char *host, const char *command);
+static char *slurp_first_line(FILE *fp) {
+    if (!fp) return NULL;
+    char buf[PATH_MAX];
+    if (!fgets(buf, sizeof(buf), fp)) return NULL;
 
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
+    if (len == 0) return NULL;
+
+    return strdup(buf);
+}
+
+static char *ssh_get_home(const char *user, const char *host) {
+    // Print $HOME reliably (no quotes needed on the var)
+    FILE *fp = ssh_popen(user, host, "printf '%s\n' \"$HOME\"");
+    if (!fp) return NULL;
+    char *line = slurp_first_line(fp);
+    pclose(fp);
+    return line; // malloc'd
+}
+
+static void resolve_remote_tilde_inplace(FuzzyState *st) {
+    if (!st || !st->ssh_mode) return;
+
+    const char *p = st->current_dir;
+    if (!p || p[0] != '~') return;
+
+    // We support: ~, ~/, ~/something
+    // We intentionally do NOT support ~user or ~user/... (could add later).
+    if (p[1] != '\0' && p[1] != '/') return;
+
+    char *home = ssh_get_home(st->ssh_user, st->ssh_host);
+    if (!home || !home[0]) {
+        free(home);
+        return;
+    }
+
+    char resolved[PATH_MAX];
+    resolved[0] = '\0';
+
+    if (p[1] == '\0') {
+        // "~"
+        snprintf(resolved, sizeof(resolved), "%s", home);
+    } else {
+        // "~/" or "~/..."
+        const char *rest = p + 1; // points at "/..."
+        snprintf(resolved, sizeof(resolved), "%s%s", home, rest);
+    }
+
+    free(home);
+
+    strncpy(st->current_dir, resolved, PATH_MAX - 1);
+    st->current_dir[PATH_MAX - 1] = '\0';
+}
+static char *quote_dash_safe(const char *path) {
+    if (!path) return NULL;
+
+    // Normalize leading '-' (mostly defensive; "cd" won't treat it as an option,
+    // but other commands might if you reuse this elsewhere).
+    const char *p = path;
+    char *tmp = NULL;
+
+    if (p[0] == '-' && p[1] != '\0') {
+        size_t n = strlen(p) + 3; // "./" + path + NUL
+        tmp = (char*)malloc(n);
+        if (!tmp) return NULL;
+        snprintf(tmp, n, "./%s", p);
+        p = tmp;
+    }
+
+    // Single-quote for shell: ' -> '\'' sequence
+    size_t len = strlen(p);
+    size_t extra = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '\'') extra += 3;
+    }
+
+    char *out = (char*)malloc(len + extra + 3);
+    if (!out) { free(tmp); return NULL; }
+
+    char *w = out;
+    *w++ = '\'';
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '\'') {
+            memcpy(w, "'\\''", 4);
+            w += 4;
+        } else {
+            *w++ = p[i];
+        }
+    }
+    *w++ = '\'';
+    *w = '\0';
+
+    free(tmp);
+    return out;
+}
 static long now_ms(void) {
 #if defined(CLOCK_MONOTONIC)
     struct timespec ts;
@@ -1045,23 +1142,28 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
 
     clear_lines(st);
 
-    char *qpath = sh_sq(path);
+    char *qpath = quote_dash_safe(path);
     if (!qpath) {
         fprintf(stderr, "Out of memory\n");
         return;
     }
 
+    // If cd fails, emit a sentinel and exit nonzero so we don't "ls ~" by accident.
     char ls_cmd[2048];
     int written;
 
     if (st->show_hidden) {
         written = snprintf(ls_cmd, sizeof(ls_cmd),
-                           "cd -- %s 2>/dev/null && ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null",
-                           qpath);
+            "cd %s 2>/dev/null || { printf '__NBL_CD_FAIL__\\n'; exit 42; }; "
+            "ls -Ap1 --color=never 2>/dev/null || ls -Ap1 2>/dev/null",
+            qpath
+        );
     } else {
         written = snprintf(ls_cmd, sizeof(ls_cmd),
-                           "cd -- %s 2>/dev/null && ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null",
-                           qpath);
+            "cd %s 2>/dev/null || { printf '__NBL_CD_FAIL__\\n'; exit 42; }; "
+            "ls -p1 --color=never 2>/dev/null || ls -p1 2>/dev/null",
+            qpath
+        );
     }
 
     free(qpath);
@@ -1086,6 +1188,14 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
         }
         if (len == 0) continue;
 
+        // Sentinel: cd failed -> don't lie by listing ~
+        if (strcmp(line, "__NBL_CD_FAIL__") == 0) {
+            fprintf(stderr, "SSH: failed to cd into: %s\n", st->current_dir);
+            pclose(fp);
+            clear_lines(st);
+            return;
+        }
+
         if (strcmp(line, ".") == 0) continue;
 
         if (strncmp(line, "Permission denied", 17) == 0 ||
@@ -1093,9 +1203,11 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
             strncmp(line, "Host key verification failed", 28) == 0) {
             fprintf(stderr, "SSH error: %s\n", line);
             pclose(fp);
+            clear_lines(st);
             return;
         }
 
+        // (keep your exec marking logic)
         int is_dir = (len > 0 && line[len - 1] == '/');
 
         if (!is_dir && strcmp(line, "..") != 0) {
@@ -1106,10 +1218,11 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
             size_t nlen = strlen(name);
             if (nlen > 0 && name[nlen - 1] == '*') name[nlen - 1] = '\0';
 
-            char full[MAX_LINE_LEN * 2];
-            snprintf(full, sizeof(full), "%s/%s", path, name);
+            char full[PATH_MAX];
+            const char *sep = (path[0] && path[strlen(path) - 1] == '/') ? "" : "/";
+            snprintf(full, sizeof(full), "%s%s%s", path, sep, name);
 
-            char *qfull = sh_sq(full);
+            char *qfull = quote_dash_safe(full);
             if (qfull) {
                 char stat_cmd[2048];
                 int stat_written = snprintf(stat_cmd, sizeof(stat_cmd),
@@ -1140,16 +1253,17 @@ static void load_ssh_directory(FuzzyState *st, const char *path) {
 
     int status = pclose(fp);
     if (status != 0) {
+        // If cd failed we already handled it; otherwise keep this.
         fprintf(stderr, "SSH command exited with status %d\n", WEXITSTATUS(status));
     }
 }
-
 static int load_ssh_file(FuzzyState *st, const char *path) {
     if (!path || !path[0]) return 0;
 
-    char user[256], host[256], remote_path[256];
+    char user[256], host[256], remote_path[PATH_MAX];
 
-    if (!parse_ssh_path(path, user, sizeof(user), host, sizeof(host), remote_path, sizeof(remote_path))) {
+    if (!parse_ssh_path(path, user, sizeof(user), host, sizeof(host),
+                        remote_path, sizeof(remote_path))) {
         return 0;
     }
 
@@ -1158,8 +1272,16 @@ static int load_ssh_file(FuzzyState *st, const char *path) {
     strncpy(st->ssh_user, user, sizeof(st->ssh_user) - 1);
     st->ssh_user[sizeof(st->ssh_user) - 1] = '\0';
 
-    char command[512];
-    int written = snprintf(command, sizeof(command), "cat '%s'", remote_path);
+    char *qremote = quote_dash_safe(remote_path);
+    if (!qremote) {
+        fprintf(stderr, "Out of memory\n");
+        return 0;
+    }
+
+    char command[PATH_MAX + 64];
+    int written = snprintf(command, sizeof(command), "cat %s", qremote);
+    free(qremote);
+
     if (written < 0 || written >= (int)sizeof(command)) {
         fprintf(stderr, "Remote path too long\n");
         return 0;
@@ -1181,7 +1303,6 @@ static int load_ssh_file(FuzzyState *st, const char *path) {
 
     return 1;
 }
-
 static int load_files(FuzzyState *st, int argc, char **argv, int first_file_idx) {
     int loaded_any = 0;
     for (int i = first_file_idx; i < argc; i++) {
@@ -1650,7 +1771,14 @@ static void refresh_source(FuzzyState *st) {
     int success = 0;
 
     if (st->is_directory_mode) {
-        if (st->ssh_mode) load_ssh_directory(st, st->current_dir);
+if (st->is_directory_mode) {
+    if (st->ssh_mode) {
+        resolve_remote_tilde_inplace(st);
+        load_ssh_directory(st, st->current_dir);
+    } else {
+        load_directory(st, st->current_dir);
+    }
+}
         else load_directory(st, st->current_dir);
         success = (st->line_count > 0);
 
@@ -2011,7 +2139,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 const char *dir_arg = argv[++i];
 
-                char user[256], host[256], remote_path[256];
+                char user[256], host[256], remote_path[PATH_MAX];
                 if (parse_ssh_path(dir_arg,
                                    user, sizeof(user),
                                    host, sizeof(host),
@@ -2025,6 +2153,7 @@ static int parse_flags(int argc, char **argv, FuzzyState *st) {
                     st->ssh_host[sizeof(st->ssh_host) - 1] = '\0';
 
                     strncpy(st->current_dir, remote_path, PATH_MAX - 1);
+                    resolve_remote_tilde_inplace(st);
                     st->current_dir[PATH_MAX - 1] = '\0';
                 } else {
                     strncpy(st->current_dir, dir_arg, PATH_MAX - 1);
